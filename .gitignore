@@ -1,0 +1,6 @@
+data
+*results
+*checkpoints
+*work_dirs
+*.pth
+model/*.pth

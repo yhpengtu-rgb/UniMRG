@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug UniMRG Train (Multi GPU)",
+      "type": "python",
+      "request": "launch",
+      "module": "torch.distributed.run",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "/cpfs01/projects-HDD/cfff-6f3a36a0cd1e_HDD/public/tupeng/UniMRG/Harmon",
+        "NCCL_NVLS_ENABLE": "0",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3" // 如果需要4卡
+      },
+      "args": [
+        "--nproc_per_node=1", // 还原您脚本中的 4 卡设定
+        "--nnodes=1",
+        "--node_rank=0",
+        "--master_addr=127.0.0.1",
+        "--master_port=12348",
+        "./scripts/train.py",
+        "configs/examples/UniMRG_dllm.py",
+        "--launcher",
+        "pytorch",
+        "--deepspeed",
+        "deepspeed_zero2"
+      ]
+    }
+  ]
+}
