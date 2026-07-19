@@ -64,10 +64,7 @@ class Harmon(BaseModel):
         
         # Load Checkpoint
         print(f"Loading checkpoint: {self.checkpoint_path}")
-        if os.path.isdir(self.checkpoint_path):
-            checkpoint = guess_load_checkpoint(self.checkpoint_path)
-        else:
-            checkpoint = torch.load(self.checkpoint_path, weights_only=False) # Harmon uses weights_only=False in utils.py
+        checkpoint = self._load_checkpoint(self.checkpoint_path)
             
         info = model.load_state_dict(checkpoint, strict=False)
         
@@ -100,6 +97,41 @@ class Harmon(BaseModel):
         self.kwargs = default_kwargs
         
         warnings.warn(f'Harmon model loaded. Generation kwargs: {self.kwargs}')
+
+    @staticmethod
+    def _load_checkpoint(checkpoint_path):
+        """
+        智能加载模型权重，支持：
+          1. 普通 .pth 文件（mmengine / 原生 torch.load）
+          2. DeepSpeed ZeRO-2 目录：从 mp_rank_00_model_states.pt 里提取 ckpt['module']
+          3. 普通目录：尝试 guess_load_checkpoint
+        """
+        import os
+        import torch
+        from xtuner.model.utils import guess_load_checkpoint
+
+        if os.path.isdir(checkpoint_path):
+            # 检查是否是 DeepSpeed ZeRO 目录
+            model_states = os.path.join(checkpoint_path, 'mp_rank_00_model_states.pt')
+            if os.path.isfile(model_states):
+                print(f"[Harmon] 检测到 DeepSpeed ZeRO-2 目录，从 {model_states} 加载模型权重")
+                ck = torch.load(model_states, map_location='cpu', weights_only=False)
+                if 'module' in ck:
+                    return ck['module']
+                raise KeyError(f"'module' key not found in {model_states}. Keys: {list(ck.keys())}")
+            # 尝试 xtuner 的 guess_load_checkpoint
+            return guess_load_checkpoint(checkpoint_path)
+        else:
+            # 单文件：尝试 mmengine 格式，再尝试原生
+            try:
+                ck = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            except TypeError:
+                ck = torch.load(checkpoint_path, map_location='cpu')
+            for key in ('state_dict', 'module', 'model'):
+                if isinstance(ck, dict) and key in ck and isinstance(ck[key], dict):
+                    print(f"[Harmon] 从 checkpoint['{key}'] 提取权重")
+                    return ck[key]
+            return ck
 
     def expand2square(self, pil_img, background_color=(127, 127, 127)):
         """Expand image to square by padding"""
