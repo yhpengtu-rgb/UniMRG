@@ -1319,10 +1319,34 @@ janus_series = {
 }
 
 harmon_series = {
+    # 官方预训练基座（iter_4000 dLLM 训练）
     "Harmon": partial(
         Harmon,
         model_path="/cpfs01/projects-HDD/cfff-6f3a36a0cd1e_HDD/public/tupeng/UniMRG/Harmon/configs/models/qwen2_5_1_5b_kl16_mar_h.py",
         checkpoint_path="/cpfs01/projects-HDD/cfff-6f3a36a0cd1e_HDD/public/tupeng/UniMRG/Harmon/work_dirs/UniMRG_dllm/iter_4000.pth",
+    ),
+    # 本地：官方预训练基座权重 harmon_1.5b.pth
+    "HarmonBase": partial(
+        Harmon,
+        model_path="/home/xiexu/code/UniMRG/Harmon/configs/examples/UniMRG_infer.py",
+        checkpoint_path="/nvmedata/xiexu/data/uni/harmon_1.5b.pth",
+    ),
+    # 本地： UniMRG dLLM 微调 10k 步模型
+    "HarmonDLLM10k": partial(
+        Harmon,
+        model_path="/home/xiexu/code/UniMRG/Harmon/configs/examples/UniMRG_infer.py",
+        checkpoint_path="/home/xiexu/code/UniMRG/Harmon/work_dirs/UniMRG_dllm/iter_10000.pth",
+    ),
+    # 本地：dLLM 微调 10k 步 + Block Diffusion 解码
+    # block_size=4 与训练配置 UniMRG_dllm.py 对齐
+    "HarmonDLLM10k_BD": partial(
+        Harmon,
+        model_path="/home/xiexu/code/UniMRG/Harmon/configs/examples/UniMRG_infer.py",
+        checkpoint_path="/home/xiexu/code/UniMRG/Harmon/work_dirs/UniMRG_dllm/iter_10000.pth",
+        use_dllm=True,
+        block_size=4,
+        denoising_steps=4,
+        max_new_tokens=512,
     ),
 }
 

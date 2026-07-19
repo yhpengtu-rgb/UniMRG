@@ -31,7 +31,8 @@ class Harmon(BaseModel):
                 'Please ensure Harmon and its dependencies (mmengine, xtuner) are available.')
             raise e
 
-    def __init__(self, model_path=None, checkpoint_path=None, image_size=512, **kwargs):
+    def __init__(self, model_path=None, checkpoint_path=None, image_size=512,
+                 use_dllm=False, block_size=32, denoising_steps=None, **kwargs):
         """
         Initialize Harmon model for VLM evaluation.
         
@@ -39,6 +40,9 @@ class Harmon(BaseModel):
             model_path: Path to model config file (Config)
             checkpoint_path: Path to model checkpoint (Checkpoint)
             image_size: Input image size (default: 512)
+            use_dllm: If True, use block diffusion decoding instead of AR.
+            block_size: Block size for dLLM decoding.
+            denoising_steps: Number of denoising iterations per block (default=block_size).
             **kwargs: Additional generation kwargs
         """
         self.check_install()
@@ -53,9 +57,17 @@ class Harmon(BaseModel):
         self.config_path = model_path
         self.checkpoint_path = checkpoint_path
         self.image_size = image_size
+        self.use_dllm = use_dllm
+        self.dllm_block_size = block_size
+        self.dllm_denoising_steps = denoising_steps
         
         # Load Config
         config = Config.fromfile(self.config_path)
+        
+        # If using dLLM decoding, ensure model is built with dllm=True
+        if self.use_dllm:
+            config.model['dllm'] = True
+            config.model['block_size'] = block_size
         
         # Build Model
         print(f"Building Harmon model from {self.config_path}...")
@@ -64,10 +76,7 @@ class Harmon(BaseModel):
         
         # Load Checkpoint
         print(f"Loading checkpoint: {self.checkpoint_path}")
-        if os.path.isdir(self.checkpoint_path):
-            checkpoint = guess_load_checkpoint(self.checkpoint_path)
-        else:
-            checkpoint = torch.load(self.checkpoint_path, weights_only=False) # Harmon uses weights_only=False in utils.py
+        checkpoint = self._load_checkpoint(self.checkpoint_path)
             
         info = model.load_state_dict(checkpoint, strict=False)
         
@@ -94,12 +103,43 @@ class Harmon(BaseModel):
         default_kwargs = dict(
             max_new_tokens=1024,
             do_sample=False,
-            temperature=0.0, # Not used when do_sample=False
+            temperature=0.0,
         )
         default_kwargs.update(kwargs)
         self.kwargs = default_kwargs
         
-        warnings.warn(f'Harmon model loaded. Generation kwargs: {self.kwargs}')
+        mode_str = 'dLLM (block diffusion)' if self.use_dllm else 'AR (autoregressive)'
+        warnings.warn(f'Harmon model loaded [{mode_str}]. Generation kwargs: {self.kwargs}')
+
+    @staticmethod
+    def _load_checkpoint(checkpoint_path):
+        import os
+        import torch
+        from xtuner.model.utils import guess_load_checkpoint
+
+        if os.path.isdir(checkpoint_path):
+            # 检查是否是 DeepSpeed ZeRO 目录
+            model_states = os.path.join(checkpoint_path, 'mp_rank_00_model_states.pt')
+            if os.path.isfile(model_states):
+                print(f"[Harmon] 检测到 DeepSpeed ZeRO-2 目录，从 {model_states} 加载模型权重")
+                ck = torch.load(model_states, map_location='cpu', weights_only=False)
+                if 'module' in ck:
+                    return ck['module']
+                raise KeyError(f"'module' key not found in {model_states}. Keys: {list(ck.keys())}")
+            # 尝试 xtuner 的 guess_load_checkpoint
+            return guess_load_checkpoint(checkpoint_path)
+        else:
+            # 单文件：尝试 mmengine 格式（state_dict key），再尝试原生
+            try:
+                ck = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            except TypeError:
+                ck = torch.load(checkpoint_path, map_location='cpu')
+            # 常见 wrapper key
+            for key in ('state_dict', 'module', 'model'):
+                if isinstance(ck, dict) and key in ck and isinstance(ck[key], dict):
+                    print(f"[Harmon] 从 checkpoint['{key}'] 提取权重")
+                    return ck[key]
+            return ck
 
     def expand2square(self, pil_img, background_color=(127, 127, 127)):
         """Expand image to square by padding"""
@@ -134,14 +174,18 @@ class Harmon(BaseModel):
     def generate_inner(self, message, dataset=None):
         """
         Generate response using Harmon model.
+        Supports both AR (autoregressive) and dLLM (block diffusion) decoding.
         """
         prompt, image_path = self.message_to_promptimg(message)
-        
+
         if image_path is None:
-            # Text-only input not fully supported by this specific pipeline logic, 
-            # but we can try without image features if needed.
-            # However, Harmon seems designed for VLM.
             return "Error: Image required for Harmon evaluation."
+
+        if dataset is not None and DATASET_TYPE(dataset) == 'MCQ':
+            prompt = (
+                f"{prompt.rstrip()}\n"
+                "Answer with the option's letter from the given choices directly."
+            )
 
         # Process Image
         image_tensor = self.process_image(image_path)
@@ -172,24 +216,39 @@ class Harmon(BaseModel):
         
         # Generate
         with torch.no_grad():
-            output = self.model.llm.generate(
-                inputs_embeds=inputs_embeds,
-                use_cache=True,
-                do_sample=self.kwargs.get('do_sample', False),
-                max_new_tokens=self.kwargs.get('max_new_tokens', 1024),
-                eos_token_id=self.model.tokenizer.eos_token_id,
-                pad_token_id=self.model.tokenizer.pad_token_id 
-                if self.model.tokenizer.pad_token_id is not None else 
-                self.model.tokenizer.eos_token_id,
-                temperature=self.kwargs.get('temperature', 1.0) if self.kwargs.get('do_sample', False) else None
-            )
-            
-        # Decode
-        full_output = self.model.tokenizer.decode(output[0], skip_special_tokens=False)
-        response = full_output.replace('<|im_end|>', '').replace('<|endoftext|>', '').strip()
-        
+            if self.use_dllm:
+                # Block Diffusion decoding
+                generated_ids = self.model.generate_dllm(
+                    inputs_embeds=inputs_embeds,
+                    max_new_tokens=self.kwargs.get('max_new_tokens', 512),
+                    block_size=self.dllm_block_size,
+                    denoising_steps=self.dllm_denoising_steps,
+                    temperature=self.kwargs.get('temperature', 0.0),
+                )
+                # Decode generated token IDs
+                response = self.model.tokenizer.decode(
+                    generated_ids[0], skip_special_tokens=True
+                )
+            else:
+                # Standard AR decoding
+                output = self.model.llm.generate(
+                    inputs_embeds=inputs_embeds,
+                    use_cache=True,
+                    do_sample=self.kwargs.get('do_sample', False),
+                    max_new_tokens=self.kwargs.get('max_new_tokens', 1024),
+                    eos_token_id=self.model.tokenizer.eos_token_id,
+                    pad_token_id=self.model.tokenizer.pad_token_id 
+                    if self.model.tokenizer.pad_token_id is not None else 
+                    self.model.tokenizer.eos_token_id,
+                    temperature=self.kwargs.get('temperature', 1.0) if self.kwargs.get('do_sample', False) else None
+                )
+                response = self.model.tokenizer.decode(output[0], skip_special_tokens=True)
+
+        response = response.strip()
+        if response.endswith('.'):
+            response = response[:-1]
+
         return response
 
     def use_custom_prompt(self, dataset):
         return False
-

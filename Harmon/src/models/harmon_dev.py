@@ -6,6 +6,7 @@ from torch.autograd.function import Function
 from mmengine.logging import print_log
 from xtuner.model.utils import guess_load_checkpoint
 from xtuner.utils import IMAGE_TOKEN_INDEX
+from transformers.cache_utils import DynamicCache
 from .harmon import Harmon
 from torch.nn.utils.rnn import pad_sequence
 
@@ -146,6 +147,11 @@ class HarmonDev(Harmon, BaseModel):
         if loss_mask is not None:
             loss_mask = loss_mask.to(self.device)
 
+        # 【新增】：取出 create_dllm_batch 构造的 position_ids（仅 dllm 分支存在）
+        position_ids = data_dict.get('position_ids', None)
+        if position_ids is not None:
+            position_ids = position_ids.to(self.device)
+
         labels = data_dict['labels'].to(self.device)
         pixel_values = data_dict.get('pixel_values', None)
         if pixel_values is None:
@@ -230,6 +236,15 @@ class HarmonDev(Harmon, BaseModel):
                 )
                 data_dict['loss_mask'] = loss_mask
 
+            # 【新增】：图像占位 1→1088 同步扩展 position_ids，保持与 input_ids 对齐，
+            # 且重新映射到“im_start user...IMG_1...IMG_1088...”的康康位置，保证 RoPE 与纯 AR 一致。
+            if position_ids is not None:
+                base_pos_at_img = position_ids[:, 3:4]  # [b, 1]
+                img_offsets = torch.arange(1088, device=position_ids.device, dtype=position_ids.dtype).unsqueeze(0)
+                image_pos_ids = base_pos_at_img + img_offsets  # [b, 1088]
+                after_pos = position_ids[:, 4:] + 1087
+                position_ids = torch.cat([position_ids[:, :3], image_pos_ids, after_pos], dim=1)
+
             inputs_embeds = z_enc.new_zeros(*input_ids.shape, self.llm.config.hidden_size)
             inputs_embeds[input_ids == IMAGE_TOKEN_INDEX] = z_enc.flatten(0, 1)
             inputs_embeds[input_ids != IMAGE_TOKEN_INDEX] = self.llm.get_input_embeddings()(
@@ -241,9 +256,16 @@ class HarmonDev(Harmon, BaseModel):
             float_mask = float_mask.masked_fill(~attention_mask, torch.finfo(inputs_embeds.dtype).min)
             attention_mask = float_mask
 
-        output = self.llm_model(inputs_embeds=inputs_embeds,
-                                attention_mask=attention_mask,
-                                return_dict=True)
+        # 【修改】：dllm 分支显式传 position_ids，否则 HF 会自动 arange 导致 clean/noisy 段数据分布不对齐。
+        llm_kwargs = dict(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+        if getattr(self, "dllm", False) and position_ids is not None:
+            llm_kwargs['position_ids'] = position_ids
+
+        output = self.llm_model(**llm_kwargs)
 
         if getattr(self, "dllm", False):
             logits2keep = data_dict['loss_mask'] & data_dict['response_mask']
@@ -685,22 +707,25 @@ class HarmonDev(Harmon, BaseModel):
         clean_end = min(prefix_len + res_len, seq_len)
         noisy_start = clean_end
 
-        block_ids[:clean_start] = torch.arange(clean_start) // block_size
+        # Prefix: 每个 token 独占一个 block_id，让 base_mask 退化为严格 token 级 causal，
+        # 避免把 Qwen 预训练的因果分布破坏成块内双向。
+        block_ids[:clean_start] = torch.arange(clean_start)
         token_types[:clean_start] = 0
 
+        # 响应段的 block_id 从 prefix_len 起递增（保持与 prefix 完全隔离）
+        response_block_offset = clean_start
+
         if clean_end > clean_start:
-            num_prefix_blocks = (prefix_len + block_size - 1) // block_size
             clean_len = clean_end - clean_start
             clean_rel_positions = torch.arange(clean_len)
-            clean_blocks = num_prefix_blocks + clean_rel_positions // block_size
+            clean_blocks = response_block_offset + clean_rel_positions // block_size
             block_ids[clean_start:clean_end] = clean_blocks
             token_types[clean_start:clean_end] = 1
 
         if noisy_start < seq_len:
-            num_prefix_blocks = (prefix_len + block_size - 1) // block_size
             noisy_len = seq_len - noisy_start
             noisy_rel_positions = torch.arange(noisy_len)
-            noisy_blocks = num_prefix_blocks + noisy_rel_positions // block_size
+            noisy_blocks = response_block_offset + noisy_rel_positions // block_size
             block_ids[noisy_start:seq_len] = noisy_blocks
             token_types[noisy_start:seq_len] = 2
 
@@ -709,9 +734,10 @@ class HarmonDev(Harmon, BaseModel):
         q_types = token_types.view(-1, 1)
         k_types = token_types.view(1, -1)
 
-        # block causal for prefix + clean blocks.
-        base_mask = q_blocks >= k_blocks
-        # attention pattern for noisy blocks.
+        # base_mask：prefix/clean 的 query 走块级因果；同时禁止任何非 noisy query 看到 noisy K。
+        # 这样 clean 段永远看不到 noisy 段，避免表征污染。
+        base_mask = (q_blocks >= k_blocks) & (k_types != 2)
+        # noisy query 的可见范围：全部 prefix + 严格前置 clean block + 同 block 的 noisy token。
         noisy_query_mask = q_types == 2
         noisy_visibility = (k_types == 0) | ((k_types == 1) & (k_blocks < q_blocks)) | ((k_types == 2) & (k_blocks == q_blocks))
         local_mask = torch.where(noisy_query_mask, noisy_visibility, base_mask)
@@ -734,6 +760,7 @@ class HarmonDev(Harmon, BaseModel):
             batch_input_ids, batch_labels = [], []
             batch_t_types, batch_b_indices = [], []
             batch_response_mask, batch_loss_mask = [], [] # 【新增】：容器
+            batch_position_ids = []  # 【新增】：per-sample position_ids，用于对齐 clean/noisy
             batch_lengths = []
             batch_t = []
 
@@ -856,12 +883,21 @@ class HarmonDev(Harmon, BaseModel):
                     sample_loss_mask = torch.zeros_like(sample_i_ids, dtype=torch.bool)
                     batch_lengths.append((len(sample_i_ids), 0))
 
+                # 【新增】：构造 position_ids，让 noisy 段与 clean 段共享位置编码，
+                # 消除 RoPE 在 clean/noisy 上的位置偏移，保证训练与推理分布一致。
+                sample_pos_ids = torch.arange(sample_i_ids.shape[0], dtype=torch.long)
+                if len_res > 0:
+                    p_len_i, r_len_i = batch_lengths[-1]
+                    sample_pos_ids[p_len_i + r_len_i : p_len_i + 2 * r_len_i] = \
+                        torch.arange(p_len_i, p_len_i + r_len_i, dtype=torch.long)
+
                 batch_input_ids.append(sample_i_ids)
                 batch_labels.append(sample_l_ids)
                 batch_t_types.append(sample_t_types)
                 batch_b_indices.append(sample_b_indices)
                 batch_response_mask.append(sample_resp_mask) # 【新增】
                 batch_loss_mask.append(sample_loss_mask)     # 【新增】
+                batch_position_ids.append(sample_pos_ids)    # 【新增】
 
             # ==========================================
             # Batch 级别的统一 Padding
@@ -875,6 +911,8 @@ class HarmonDev(Harmon, BaseModel):
             data_batch['response_mask'] = pad_sequence(batch_response_mask, batch_first=True, padding_value=False)
             data_batch['loss_mask'] = pad_sequence(batch_loss_mask, batch_first=True, padding_value=False)
             data_batch['t'] = pad_sequence(batch_t, batch_first=True, padding_value=1.0)
+            # 【新增】：position_ids padding 用 0，padded 位置本身不参与 attention（被 attention_mask 屏蔽）
+            data_batch['position_ids'] = pad_sequence(batch_position_ids, batch_first=True, padding_value=0)
             
             batch_max_len = data_batch['input_ids'].shape[1]
             batch_attn_masks = []
@@ -893,6 +931,199 @@ class HarmonDev(Harmon, BaseModel):
             
         return data_dict
         
+    # ============================================================
+    # Block Diffusion Inference (dLLM Generate)
+    # ============================================================
+
+    @torch.no_grad()
+    def generate_dllm(
+        self,
+        inputs_embeds,
+        max_new_tokens=512,
+        block_size=None,
+        denoising_steps=None,
+        temperature=0.0,
+        mask_token_id=151671,
+        eos_token_id=151645,
+    ):
+        """Block Diffusion 推理解码。
+
+        与训练对齐的解码逻辑：
+          - 块间 (inter-block): AR 因果，逐块生成并更新 KV Cache。
+          - 块内 (intra-block): 迭代去噪，使用全可见注意力；
+            每步预测所有 mask token，将置信度最高的固定，其余 remask。
+
+        Args:
+            inputs_embeds: [batch, prefix_len, hidden_dim] 已包含图像嵌入的前缀。
+            max_new_tokens: 最多生成的 token 数。
+            block_size: 每个解码块的大小，默认 self.block_size。
+            denoising_steps: 每块去噪步数，默认 block_size（每步固定约 1 个 token）。
+            temperature: 采样温度，0 = greedy argmax。
+            mask_token_id: Mask 占位符 token ID。
+            eos_token_id: 终止 token ID。
+
+        Returns:
+            generated_ids: [batch, gen_len] 生成的 token ID 序列（截断到 eos）。
+        """
+        if block_size is None:
+            block_size = getattr(self, 'block_size', 32)
+        if denoising_steps is None:
+            denoising_steps = block_size
+
+        device = self.device
+        dtype = self.dtype
+        batch_size = inputs_embeds.shape[0]
+        prefix_len = inputs_embeds.shape[1]
+        hidden_dim = inputs_embeds.shape[2]
+
+        num_blocks = (max_new_tokens + block_size - 1) // block_size
+
+        # ---------- 1. Prefix 编码，构建初始 KV Cache ----------
+        output = self.llm_model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=DynamicCache(),
+            use_cache=True,
+            return_dict=True,
+        )
+        kv_cache = output.past_key_values
+
+        # 计算每步去噪应固定的 token 数
+        transfer_schedule = self._transfer_schedule(block_size, denoising_steps)
+
+        all_block_ids = []
+        finished = False
+
+        # ---------- 2. 逐块生成 ----------
+        for b_idx in range(num_blocks):
+            # 当前块的 position_ids（与训练一致，contiguous from prefix_len + offset）
+            block_start_pos = prefix_len + b_idx * block_size
+            block_pos_ids = torch.arange(
+                block_start_pos, block_start_pos + block_size,
+                device=device, dtype=torch.long,
+            ).unsqueeze(0).expand(batch_size, -1)
+
+            # 初始化：全部为 mask token
+            block_ids = torch.full(
+                (batch_size, block_size), mask_token_id,
+                dtype=torch.long, device=device,
+            )
+
+            # 构造块内全可见 4D attention mask（禁止 HF 默认因果）
+            # shape: [batch, 1, block_size, cache_len + block_size]
+            cache_len = kv_cache.get_seq_length()
+            total_kv_len = cache_len + block_size
+            attn_mask_4d = torch.zeros(
+                (batch_size, 1, block_size, total_kv_len),
+                dtype=dtype, device=device,
+            )
+
+            # ---------- 3. 块内迭代去噪 ----------
+            for step in range(denoising_steps):
+                is_mask = (block_ids == mask_token_id)
+                if not is_mask.any():
+                    break
+
+                block_embeds = self.llm.get_input_embeddings()(block_ids)
+
+                out = self.llm_model(
+                    inputs_embeds=block_embeds,
+                    position_ids=block_pos_ids,
+                    attention_mask=attn_mask_4d,
+                    past_key_values=kv_cache,
+                    use_cache=False,
+                    return_dict=True,
+                )
+
+                # DynamicCache.update() 在 use_cache=False 时仍会扩展 cache。
+                # 用公开 API 裁剪并同步 cache 的内部长度记账。
+                kv_cache.crop(cache_len)
+
+                logits = self.llm.get_output_embeddings()(
+                    out.last_hidden_state
+                )  # [batch, block_size, vocab]
+
+                # 采样
+                if temperature > 0:
+                    probs = F.softmax(logits / temperature, dim=-1)
+                    flat_probs = probs.view(-1, probs.shape[-1])
+                    sampled_flat = torch.multinomial(flat_probs, 1)
+                    sampled_ids = sampled_flat.view(batch_size, block_size)
+                    sampled_conf = probs.gather(-1, sampled_ids.unsqueeze(-1)).squeeze(-1)
+                else:
+                    # Greedy: argmax
+                    sampled_conf = F.softmax(logits, dim=-1).max(dim=-1).values
+                    sampled_ids = logits.argmax(dim=-1)
+
+                # 仅对仍为 mask 的位置计算置信度
+                neg_inf = torch.tensor(float('-inf'), device=device)
+                confidence = torch.where(is_mask, sampled_conf, neg_inf)
+
+                # 选择 top-k 置信度最高的 token 固定
+                num_to_fix = transfer_schedule[step]
+                transfer_mask = torch.zeros_like(block_ids, dtype=torch.bool)
+                for j in range(batch_size):
+                    n_masked = is_mask[j].sum().item()
+                    k = min(num_to_fix, n_masked)
+                    if k > 0:
+                        _, topk_idx = torch.topk(confidence[j], k)
+                        transfer_mask[j, topk_idx] = True
+
+                block_ids = torch.where(transfer_mask, sampled_ids, block_ids)
+
+            # 处理残留 mask（极少情况下最后一步可能仍有 mask）
+            residual_mask = (block_ids == mask_token_id)
+            if residual_mask.any():
+                block_ids[residual_mask] = eos_token_id
+
+            all_block_ids.append(block_ids)
+
+            # 检查是否生成了 eos
+            if (block_ids == eos_token_id).any():
+                finished = True
+                break
+
+            # ---------- 4. Clean forward 更新 KV Cache ----------
+            clean_embeds = self.llm.get_input_embeddings()(block_ids)
+            clean_out = self.llm_model(
+                inputs_embeds=clean_embeds,
+                position_ids=block_pos_ids,
+                attention_mask=torch.zeros(
+                    (batch_size, 1, block_size, total_kv_len),
+                    dtype=dtype, device=device,
+                ),
+                past_key_values=kv_cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            kv_cache = clean_out.past_key_values
+
+        # ---------- 5. 拼接并截断 ----------
+        generated_ids = torch.cat(all_block_ids, dim=1)
+
+        # 截断到第一个 eos
+        for i in range(batch_size):
+            eos_pos = (generated_ids[i] == eos_token_id).nonzero(as_tuple=True)[0]
+            if len(eos_pos) > 0:
+                generated_ids[i, eos_pos[0] + 1:] = eos_token_id
+
+        return generated_ids
+
+    @staticmethod
+    def _transfer_schedule(block_size: int, num_steps: int) -> list:
+        """线性调度：每步应固定多少个 token。
+
+        总固定数 = block_size，均匀分配到 num_steps 步；
+        最后一步兜底余数，保证总和恰好 = block_size。
+        """
+        if num_steps >= block_size:
+            return [1] * block_size + [0] * (num_steps - block_size)
+        base = block_size // num_steps
+        remainder = block_size % num_steps
+        schedule = []
+        for s in range(num_steps):
+            schedule.append(base + (1 if s < remainder else 0))
+        return schedule
+
     def compute_loss(self, data_dict):
         if self.dllm: data_dict = self.create_dllm_batch(data_dict)
 
@@ -901,13 +1132,13 @@ class HarmonDev(Harmon, BaseModel):
         for data_type, batch_data in data_dict.items():
             if 'text2image' in data_type:
                 loss = self.text2image_loss(batch_data)
-                losses[f'loss_{data_type}'] = loss * self.loss_weights[data_type]
+                losses[f'loss_{data_type}'] = loss * self.loss_weights.get(data_type, 1.0)
             elif 'image2text' in data_type:
                 loss = self.image2text_loss(batch_data)
-                losses[f'loss_{data_type}'] = loss * self.loss_weights[data_type]
+                losses[f'loss_{data_type}'] = loss * self.loss_weights.get(data_type, 1.0)
             elif 'recon' in data_type:
                 loss = self.recon_loss(batch_data)
-                losses[f'loss_{data_type}'] = loss * self.loss_weights[data_type]
+                losses[f'loss_{data_type}'] = loss * self.loss_weights.get(data_type, 1.0)
             elif 'depth' in data_type:
                 # Depth reconstruction (source image -> target depth map)
                 loss = self.edit_loss(batch_data)
