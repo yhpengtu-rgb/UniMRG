@@ -37,6 +37,7 @@ class HarmonDev(Harmon, BaseModel):
                  prior_dist = 'Mask',
                  min_mask_rate = 0.001,
                  max_mask_rate = 1.0,
+                 lora=None,
                  **kwargs
                  ):
         super().__init__(**kwargs)
@@ -49,6 +50,7 @@ class HarmonDev(Harmon, BaseModel):
         self.grad_scale = grad_scale
         self.loss_weights = loss_weights
         self.debuged = False
+        self._input_require_grads_enabled = False
 
         if pretrained_pth is not None:
             pretrained_state_dict = guess_load_checkpoint(pretrained_pth)
@@ -68,6 +70,8 @@ class HarmonDev(Harmon, BaseModel):
             self.mar.z_proj_ln.requires_grad_(False)
             self.mar.encoder_pos_embed_learned.requires_grad = False
             self.mar.encoder_norm.requires_grad_(False)
+            self.mar.class_emb.requires_grad_(False)
+            self.mar.fake_latent.requires_grad = False
             print_log('Frozen MAR Encoder')
         
         if freeze_mar_decoder:
@@ -90,18 +94,61 @@ class HarmonDev(Harmon, BaseModel):
             self.proj_out.requires_grad_(False)
             print_log('Frozen proj_out')
 
+        if lora is not None:
+            self._setup_lora(lora)
+
         # gradient checkpointing
         if gradient_checkpointing:
             self.gradient_checkpointing_enable()
         else:
             self.gradient_checkpointing_disable()
 
+    def _setup_lora(self, lora):
+        if not isinstance(lora, dict):
+            raise TypeError(
+                '`lora` must be a dict containing PEFT LoraConfig fields, '
+                f'but got {type(lora).__name__}.')
+
+        lora_config_dict = dict(lora)
+        target_modules = lora_config_dict.get('target_modules')
+        if not target_modules:
+            raise ValueError(
+                '`lora.target_modules` must explicitly select the Qwen '
+                'modules that receive LoRA adapters.')
+
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError as error:
+            raise ImportError(
+                'LoRA training requires PEFT. Install it in the training '
+                'environment before setting `model.lora`.') from error
+
+        lora_config = LoraConfig(**lora_config_dict)
+        self.llm = get_peft_model(self.llm, lora_config)
+
+        trainable_params = sum(
+            parameter.numel()
+            for parameter in self.llm.parameters()
+            if parameter.requires_grad)
+        total_params = sum(
+            parameter.numel() for parameter in self.llm.parameters())
+        print_log(
+            f'Enabled LoRA: {trainable_params:,} trainable LLM parameters '
+            f'out of {total_params:,}.')
+
     def gradient_checkpointing_disable(self):
         self.llm.gradient_checkpointing_disable()
+        if self._input_require_grads_enabled:
+            self.llm.disable_input_require_grads()
+            self._input_require_grads_enabled = False
         self.mar.gradient_checkpointing_disable()
 
     def gradient_checkpointing_enable(self):
         self.llm.gradient_checkpointing_enable()
+        if (hasattr(self.llm, 'peft_config')
+                and not self._input_require_grads_enabled):
+            self.llm.enable_input_require_grads()
+            self._input_require_grads_enabled = True
         self.mar.gradient_checkpointing_enable()
 
     def state_dict(self, *args, **kwargs):

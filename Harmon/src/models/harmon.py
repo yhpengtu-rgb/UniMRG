@@ -54,6 +54,8 @@ class Harmon(nn.Module):
 
     @property
     def llm_model(self):
+        if hasattr(self.llm, 'get_base_model'):
+            return self.llm.get_base_model().model
         return self.llm.model
 
     @property
