@@ -16,6 +16,11 @@ from torch.utils.data import Dataset
 from xtuner.registry import BUILDER
 from xtuner.dataset.huggingface import process_hf_dataset
 from xtuner.dataset.utils import expand2square
+from src.datasets.guard_exclusion import (
+    filter_guard_arrow_cache,
+    load_guard_exclusion,
+    load_source_records,
+)
 
 
 def add_image_token_for_conversations(example):
@@ -80,7 +85,8 @@ class LLaVADataset(Dataset):
                  template_map_fn=None,
                  max_length=2048,
                  pad_image_to_square=False,
-                 cache_folder=None):
+                 cache_folder=None,
+                 exclusion_manifest=None):
         super().__init__()
         
         # Default cache path when cache_folder is not provided
@@ -88,15 +94,30 @@ class LLaVADataset(Dataset):
             cache_folder = DEFAULT_CACHE_FOLDER
         
         assert cache_folder or (data_path and tokenizer)
+        self.exclusion_manifest = exclusion_manifest
+        exclusion = None
+        source_records = None
+        if exclusion_manifest is not None:
+            exclusion = load_guard_exclusion(exclusion_manifest, data_path)
+            source_records = load_source_records(data_path)
 
         # Prefer loading from disk cache when present
         if os.path.exists(cache_folder):
             print_log(f'Loading cached dataset from {cache_folder}', logger='current')
             self.text_data = load_from_disk(cache_folder)
             print_log(f'Loaded {len(self.text_data)} samples from cache.', logger='current')
+            if exclusion is not None:
+                self.text_data = filter_guard_arrow_cache(
+                    self.text_data, source_records, exclusion
+                )
+                print_log(
+                    f'Applied GUARD exclusion: {len(self.text_data)} cached samples remain.',
+                    logger='current')
         else:
             # Build dataset from raw JSON / JSONL when no cache
-            if data_path.endswith('.json'):
+            if source_records is not None:
+                json_data = source_records
+            elif data_path.endswith('.json'):
                 json_data = json.load(open(data_path))
             elif data_path.endswith('.jsonl'):
                 json_data = load_jsonl(data_path)
@@ -122,12 +143,24 @@ class LLaVADataset(Dataset):
                 with_image_token=True)
             
             print(f'Processed {len(self.text_data)} samples successfully.')
+
+            filtered_text_data = None
+            if exclusion is not None:
+                # Cache the full source before exposing a filtered view.
+                filtered_text_data = filter_guard_arrow_cache(
+                    self.text_data, source_records, exclusion
+                )
             
             # Persist processed data to cache_folder
             print(f'Saving processed dataset to {cache_folder}...')
             os.makedirs(cache_folder, exist_ok=True)
             self.text_data.save_to_disk(cache_folder)
             print(f'Dataset cached successfully.')
+            if filtered_text_data is not None:
+                self.text_data = filtered_text_data
+                print_log(
+                    f'Applied GUARD exclusion: {len(self.text_data)} raw-path samples remain.',
+                    logger='current')
 
         self.image_folder = image_folder
         if isinstance(image_processor, dict) or isinstance(

@@ -1,6 +1,11 @@
 data
 *results
 *checkpoints
-*work_dirs
+work_dirs
 *.pth
+*.pt
+*.ckpt
+*.safetensors
 model/*.pth
+**/.cache/
+*.pyc

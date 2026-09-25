@@ -20,6 +20,7 @@ from mmengine.config import Config, ConfigDict
 from xtuner.dataset.huggingface import process_hf_dataset
 from xtuner.dataset.utils import expand2square
 from src.datasets.understanding.llava_datasets import add_image_token_for_conversations, load_jsonl, MARProcessor
+from src.datasets.guard_exclusion import filter_guard_training_records
 
 
 class Text2ImageDataset(Dataset):
@@ -551,6 +552,7 @@ class LLaVADepthDataset(Dataset):
                  max_length=1024,
                  crop_image=False,
                  max_samples=None,
+                 exclusion_manifest=None,
                  *args, **kwargs):
         self.data_path = data_path
         self.image_folder = image_folder
@@ -562,12 +564,16 @@ class LLaVADepthDataset(Dataset):
         self.max_length = max_length
         self.crop_image = crop_image
         self.max_samples = max_samples
+        self.exclusion_manifest = exclusion_manifest
         self._load_data(data_path)
 
     def _load_data(self, data_path):
         import json
         with open(data_path, 'r') as f:
-            self.raw_data = json.load(f)
+            raw_data = json.load(f)
+        self.raw_data = filter_guard_training_records(
+            raw_data, data_path, self.exclusion_manifest
+        )
             
         print(f"Loaded {len(self.raw_data)} samples from {data_path}", flush=True)
         
@@ -728,6 +734,7 @@ class LLaVAReconstructionDataset(Text2ImageDataset):
                  crop_image=False,
                  max_samples=None,
                  use_downscale=False,
+                 exclusion_manifest=None,
                  *args, **kwargs):
         self.data_path = data_path
         self.image_folder = image_folder
@@ -739,6 +746,7 @@ class LLaVAReconstructionDataset(Text2ImageDataset):
         self.crop_image = crop_image
         self.max_samples = max_samples
         self.use_downscale = use_downscale
+        self.exclusion_manifest = exclusion_manifest
         
         from src.datasets.text2image.consts import get_recon_prompt_list
         self.recon_prompts = get_recon_prompt_list()
@@ -748,7 +756,10 @@ class LLaVAReconstructionDataset(Text2ImageDataset):
     def _load_data(self, data_path):
         import json
         with open(data_path, 'r') as f:
-            self.raw_data = json.load(f)
+            raw_data = json.load(f)
+        self.raw_data = filter_guard_training_records(
+            raw_data, data_path, self.exclusion_manifest
+        )
             
         print(f"Loaded {len(self.raw_data)} samples from {data_path}", flush=True)
         
@@ -1001,6 +1012,7 @@ class LLaVAMaskDataset(Dataset):
                  max_length=1024,
                  crop_image=False,
                  max_samples=None,
+                 exclusion_manifest=None,
                  *args, **kwargs):
         self.data_path = data_path
         self.image_folder = image_folder
@@ -1012,12 +1024,16 @@ class LLaVAMaskDataset(Dataset):
         self.max_length = max_length
         self.crop_image = crop_image
         self.max_samples = max_samples
+        self.exclusion_manifest = exclusion_manifest
         self._load_data(data_path)
 
     def _load_data(self, data_path):
         import json
         with open(data_path, 'r') as f:
-            self.raw_data = json.load(f)
+            raw_data = json.load(f)
+        self.raw_data = filter_guard_training_records(
+            raw_data, data_path, self.exclusion_manifest
+        )
             
         print(f"Loaded {len(self.raw_data)} samples from {data_path}", flush=True)
         
@@ -1398,4 +1414,3 @@ class LLaVAJointDataset(Dataset):
         except Exception as e:
             print(f"Error processing depth for {image_file}: {e}", flush=True)
             raise e
-

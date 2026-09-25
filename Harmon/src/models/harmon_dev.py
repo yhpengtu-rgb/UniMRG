@@ -1,6 +1,10 @@
+import math
 import torch
 import torch.nn.functional as F
+from dataclasses import dataclass, replace
+from numbers import Real
 from torch.nn.modules.module import T
+from typing import Optional
 from mmengine.model import BaseModel
 from torch.autograd.function import Function
 from mmengine.logging import print_log
@@ -8,7 +12,135 @@ from xtuner.model.utils import guess_load_checkpoint
 from xtuner.utils import IMAGE_TOKEN_INDEX
 from transformers.cache_utils import DynamicCache
 from .harmon import Harmon
+from .dllm import (
+    CorruptionStateConditioner,
+    MaskedCorruptor,
+    TrainableMaskDelta,
+    ValidLogitMask,
+    harmon_token_support,
+    pack_corruption_state_features,
+    register_harmon_tokens,
+    safe_token_cross_entropy,
+)
 from torch.nn.utils.rnn import pad_sequence
+
+
+def _normalise_ddp_state_dict(state_dict):
+    """Return checkpoint keys in the namespace of a non-DDP model.
+
+    MMEngine checkpoints produced by DDP may retain a leading ``module.``
+    even after ``guess_load_checkpoint`` unwraps the outer checkpoint dict.
+    ``strict=False`` does not report this as an exception, so normalise the
+    namespace explicitly and reject ambiguous key collisions.
+    """
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            'pretrained checkpoint must resolve to a state_dict mapping, '
+            f'got {type(state_dict).__name__}')
+
+    normalised = {}
+    stripped_keys = 0
+    for original_key, value in state_dict.items():
+        key = original_key
+        if key.startswith('module.'):
+            key = key[len('module.'):]
+            stripped_keys += 1
+        if key in normalised:
+            raise RuntimeError(
+                'pretrained checkpoint contains colliding keys after DDP '
+                f'prefix normalisation: {original_key!r} -> {key!r}')
+        normalised[key] = value
+    return normalised, stripped_keys
+
+
+def _load_pretrained_weights(
+    model,
+    pretrained_pth,
+    required_key_groups=(),
+):
+    """Load and audit a hot-start checkpoint instead of failing silently."""
+    raw_state_dict = guess_load_checkpoint(pretrained_pth)
+    state_dict, stripped_keys = _normalise_ddp_state_dict(raw_state_dict)
+    model_keys = set(model.state_dict())
+    # Raw Harmon checkpoints precede PEFT wrapping. Map only exact target keys;
+    # never silently discard the pretrained language model during cold starts.
+    if any(k.startswith('llm.') for k in state_dict) and not any(
+            k.startswith('llm.base_model.') for k in state_dict):
+        remapped = {}
+        for key, value in state_dict.items():
+            target = key
+            if key.startswith('llm.') and key not in model_keys:
+                candidate = 'llm.base_model.model.' + key[len('llm.'):]
+                if candidate in model_keys:
+                    target = candidate
+                else:
+                    prefix, suffix = candidate.rsplit('.', 1)
+                    candidate = prefix + '.base_layer.' + suffix
+                    if candidate in model_keys:
+                        target = candidate
+                    else:
+                        raise RuntimeError(f'Unmatched raw Harmon LLM key: {key}')
+            if target in remapped:
+                raise RuntimeError(f'Checkpoint key collision: {target}')
+            remapped[target] = value
+        state_dict = remapped
+    matched_keys = model_keys.intersection(state_dict)
+    if not matched_keys:
+        sample_keys = list(state_dict)[:3]
+        raise RuntimeError(
+            f'Pretrained checkpoint {pretrained_pth!r} matched 0 model keys '
+            f'out of {len(state_dict)} checkpoint keys. Sample checkpoint '
+            f'keys: {sample_keys}')
+
+    required_group_counts = {}
+    for marker in required_key_groups:
+        if not isinstance(marker, str) or not marker:
+            raise ValueError(
+                'pretrained_required_key_groups entries must be non-empty '
+                f'strings, got {marker!r}')
+        checkpoint_group = {
+            key for key in state_dict if marker in key
+        }
+        matched_group = checkpoint_group.intersection(matched_keys)
+        if not checkpoint_group:
+            raise RuntimeError(
+                f'Pretrained checkpoint {pretrained_pth!r} is missing '
+                f'required key group {marker!r}')
+        if matched_group != checkpoint_group:
+            unmatched = sorted(checkpoint_group - matched_group)[:3]
+            raise RuntimeError(
+                f'Pretrained checkpoint {pretrained_pth!r} required key '
+                f'group {marker!r} matched {len(matched_group)}/'
+                f'{len(checkpoint_group)} keys; unmatched sample={unmatched}')
+        required_group_counts[marker] = len(matched_group)
+
+    info = model.load_state_dict(state_dict, strict=False)
+    loaded_keys = len(state_dict) - len(info.unexpected_keys)
+    report = {
+        'path': str(pretrained_pth),
+        'checkpoint_keys': len(state_dict),
+        'matched_keys': loaded_keys,
+        'namespace_matched_keys': len(matched_keys),
+        'stripped_ddp_keys': stripped_keys,
+        'missing_keys': len(info.missing_keys),
+        'unexpected_keys': len(info.unexpected_keys),
+        'missing_key_names': list(info.missing_keys),
+        'unexpected_key_names': list(info.unexpected_keys),
+        'required_key_groups': required_group_counts,
+    }
+    model.pretrained_load_report = report
+    print_log(
+        'Loaded pretrained weights from {}: matched={}/{}, '
+        'stripped_ddp={}, missing={}, unexpected={}'.format(
+            pretrained_pth,
+            report['matched_keys'],
+            report['checkpoint_keys'],
+            report['stripped_ddp_keys'],
+            report['missing_keys'],
+            report['unexpected_keys'],
+        ))
+    return report
+
 
 class _ScaleGradient(Function):
     @staticmethod
@@ -21,11 +153,20 @@ class _ScaleGradient(Function):
         return grad_output * ctx.scale, None
 
 
+@dataclass(frozen=True)
+class _Image2TextLossResult:
+    base_loss: torch.Tensor
+    last_hidden_state: torch.Tensor
+    response_mask: Optional[torch.Tensor]
+    loss_mask: Optional[torch.Tensor]
+
+
 class HarmonDev(Harmon, BaseModel):
     def __init__(self,
                  grad_scale=0.1,
                  loss_weights={'image2text': 1.0, 'text2image': 1.0, 'recon': 1.0, 'edit': 1.0},
                  pretrained_pth=None,
+                 pretrained_required_key_groups=(),
                  freeze_llm=False,
                  freeze_mar_encoder=False,
                  freeze_mar_decoder=False,
@@ -38,9 +179,253 @@ class HarmonDev(Harmon, BaseModel):
                  min_mask_rate = 0.001,
                  max_mask_rate = 1.0,
                  lora=None,
+                 mask_token_strategy='legacy',
+                 legacy_mask_token_id=151671,
+                 trainable_mask_delta=False,
+                 enforce_nonempty_dllm_targets=False,
+                 safe_dllm_loss=False,
+                 mask_invalid_dllm_logits=False,
+                 state_conditioner=False,
+                 state_conditioner_fields=('t', 'u', 'h'),
+                 state_conditioner_mode='additive_zero_init',
+                 clean_anchor_weight=0.0,
+                 guard_enabled=False,
+                 guard_submodel='R6',
+                 guard_risk_head_path=None,
+                 guard_risk_head_hidden=None,
+                 guard_risk_head_proj_hidden=128,
+                 guard_risk_head_state_dim=3,
+                 guard_train_rounds=1,
+                 guard_gate_regularizer_weight=0.0,
+                 guard_base_loss_weight=0.0,
+                 tracer_router_enabled=True,
+                 tracer_policy_enabled=True,
+                 mrare_enabled=False,
+                 mrare_distill_enabled=False,
+                 mrare_lambda_positive=0.0,
+                 mrare_lambda_rank=0.0,
+                 mrare_lambda_distill=0.0,
+                 mrare_margin=0.25,
+                 mrare_tau_energy=1.0,
+                 mrare_tau_token=1.0,
+                 mrare_force_changed_token=False,
+                 mrare_positive_only=False,
+                 mrfc_enabled=False,
+                 mrfc_critic_path=None,
+                 mrfc_lambda_pair=0.0,
+                 mrfc_lambda_distill=0.0,
+                 mrfc_margin=0.25,
+                 mrfc_tau_critic=1.0,
                  **kwargs
                  ):
+        if not isinstance(mrare_enabled, bool):
+            raise TypeError('mrare_enabled must be a bool')
+        if not isinstance(mrare_distill_enabled, bool):
+            raise TypeError('mrare_distill_enabled must be a bool')
+        if mrare_distill_enabled and not mrare_enabled:
+            raise ValueError(
+                'mrare_distill_enabled requires mrare_enabled=True')
+        if not isinstance(mrare_positive_only, bool):
+            raise TypeError('mrare_positive_only must be a bool')
+        if mrare_positive_only and not mrare_enabled:
+            raise ValueError(
+                'mrare_positive_only requires mrare_enabled=True')
+        if mrare_positive_only and mrare_distill_enabled:
+            raise ValueError(
+                'mrare_positive_only is incompatible with distillation')
+        if not isinstance(mrfc_enabled, bool):
+            raise TypeError('mrfc_enabled must be a bool')
+        if mrfc_enabled and mrare_enabled:
+            raise ValueError('MR-FC and MR-ARE cannot be enabled together')
+
+        mrare_scalars = {
+            'mrare_lambda_positive': mrare_lambda_positive,
+            'mrare_lambda_rank': mrare_lambda_rank,
+            'mrare_lambda_distill': mrare_lambda_distill,
+            'mrare_margin': mrare_margin,
+            'mrare_tau_energy': mrare_tau_energy,
+            'mrare_tau_token': mrare_tau_token,
+        }
+        for name, value in mrare_scalars.items():
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f'{name} must be a real scalar')
+            if not math.isfinite(float(value)):
+                raise ValueError(f'{name} must be finite')
+        for name in (
+            'mrare_lambda_positive',
+            'mrare_lambda_rank',
+            'mrare_lambda_distill',
+            'mrare_margin',
+        ):
+            if float(mrare_scalars[name]) < 0.0:
+                raise ValueError(f'{name} must be nonnegative')
+        for name in ('mrare_tau_energy', 'mrare_tau_token'):
+            if float(mrare_scalars[name]) <= 0.0:
+                raise ValueError(f'{name} must be positive')
+        mrfc_scalars = {
+            'mrfc_lambda_pair': mrfc_lambda_pair,
+            'mrfc_lambda_distill': mrfc_lambda_distill,
+            'mrfc_margin': mrfc_margin,
+            'mrfc_tau_critic': mrfc_tau_critic,
+        }
+        for name, value in mrfc_scalars.items():
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f'{name} must be a real scalar')
+            if not math.isfinite(float(value)):
+                raise ValueError(f'{name} must be finite')
+        for name in ('mrfc_lambda_pair', 'mrfc_lambda_distill', 'mrfc_margin'):
+            if float(mrfc_scalars[name]) < 0.0:
+                raise ValueError(f'{name} must be nonnegative')
+        if float(mrfc_tau_critic) <= 0.0:
+            raise ValueError('mrfc_tau_critic must be positive')
+        if mrfc_enabled and not mrfc_critic_path:
+            raise ValueError('mrfc_enabled requires mrfc_critic_path')
+
         super().__init__(**kwargs)
+        self.mrare_enabled = mrare_enabled
+        self.mrare_distill_enabled = mrare_distill_enabled
+        self.mrare_lambda_positive = float(mrare_lambda_positive)
+        self.mrare_lambda_rank = float(mrare_lambda_rank)
+        self.mrare_lambda_distill = float(mrare_lambda_distill)
+        self.mrare_margin = float(mrare_margin)
+        self.mrare_tau_energy = float(mrare_tau_energy)
+        self.mrare_tau_token = float(mrare_tau_token)
+        if not isinstance(mrare_force_changed_token, bool):
+            raise TypeError('mrare_force_changed_token must be a bool')
+        if mrare_force_changed_token and not mrare_enabled:
+            raise ValueError(
+                'mrare_force_changed_token requires mrare_enabled=True')
+        self.mrare_force_changed_token = mrare_force_changed_token
+        self.mrare_positive_only = mrare_positive_only
+        self.mrfc_enabled = mrfc_enabled
+        self.mrfc_lambda_pair = float(mrfc_lambda_pair)
+        self.mrfc_lambda_distill = float(mrfc_lambda_distill)
+        self.mrfc_margin = float(mrfc_margin)
+        self.mrfc_tau_critic = float(mrfc_tau_critic)
+        self.mrfc_critic_ensemble = None
+        if self.mrfc_enabled:
+            from .dllm.mrfc import FrozenMRFCCriticEnsemble
+            self.mrfc_critic_ensemble = FrozenMRFCCriticEnsemble(
+                str(mrfc_critic_path))
+            print_log(
+                'MR-FC: loaded {} frozen main critics from {} (sha256={})'
+                .format(
+                    len(self.mrfc_critic_ensemble.critics),
+                    mrfc_critic_path,
+                    self.mrfc_critic_ensemble.checkpoint_sha256,
+                ))
+        if mask_token_strategy not in ('legacy', 'canonical'):
+            raise ValueError(
+                "mask_token_strategy must be 'legacy' or 'canonical'")
+        self.mask_token_strategy = mask_token_strategy
+        self.enforce_nonempty_dllm_targets = bool(
+            enforce_nonempty_dllm_targets)
+        self.safe_dllm_loss = bool(safe_dllm_loss)
+        self.mask_invalid_dllm_logits = bool(mask_invalid_dllm_logits)
+        if state_conditioner_mode != 'additive_zero_init':
+            raise ValueError(
+                'state_conditioner_mode must be additive_zero_init'
+            )
+        self.state_conditioner_enabled = bool(state_conditioner)
+        self.state_conditioner_fields = tuple(state_conditioner_fields)
+        self.state_conditioner_mode = state_conditioner_mode
+        self.clean_anchor_weight = float(clean_anchor_weight)
+        if self.clean_anchor_weight < 0.0:
+            raise ValueError('clean_anchor_weight must be nonnegative')
+        self.dllm_state_conditioner = None
+        if self.state_conditioner_enabled:
+            self.dllm_state_conditioner = CorruptionStateConditioner(
+                hidden_size=int(self.llm.config.hidden_size),
+                fields=self.state_conditioner_fields,
+            )
+
+        # GUARD lagged conditional rank field (spec §5.6-5.7, Path C main
+        # line).  A zero-output gate function makes the routed LoRA exactly
+        # identical to static LoRA at initialization, while a small nonzero
+        # bounded amplitude keeps its first-step gradient alive.  The
+        # RiskHead is frozen and produces stop-gradient evidence g_hat.
+        self.guard_enabled = bool(guard_enabled)
+        self.guard_submodel = str(guard_submodel)
+        # New experiments expose TRACER names. ``guard_*`` remains the
+        # checkpoint-compatible internal namespace for historical weights.
+        self.tracer_router_enabled = bool(tracer_router_enabled)
+        self.tracer_policy_enabled = bool(tracer_policy_enabled)
+        self.guard_context = None
+        self._guard_lagged_evidence = None  # [batch, seq, 1] or None
+        self._guard_prev_logits = None  # for JS divergence on next round
+        self._guard_prev_candidates = None
+        self._guard_committed_history = None  # [batch, seq] bool
+        self._guard_risk_head = None
+        self._guard_isotonic = None
+        # §6.1 multi-round training: number of dLLM denoising rounds per
+        # batch.  ``1`` = single forward (legacy S1 stable baseline, gate
+        # stays at s=1 because lagged evidence is None on the first round).
+        # ``2`` (recommended) = round k teacher forward produces lagged
+        # ``g_hat`` that feeds round k+1 student forward whose RankGate
+        # actually uses the lagged signal — this is the §5.6 training-time
+        # activation of the lagged conditional rank field.  Cost = Kx
+        # main-model forward (within §1's 1.5-2.0x budget for K=2).
+        self.guard_train_rounds = int(guard_train_rounds)
+        # Opt-in direct supervision of the original masked first round.
+        # Zero preserves historical teacher-only training exactly.
+        self.guard_base_loss_weight = float(guard_base_loss_weight)
+        if not 0.0 <= self.guard_base_loss_weight <= 1.0:
+            raise ValueError('guard_base_loss_weight must be in [0, 1]')
+        if self.guard_base_loss_weight > 0.0:
+            if not (self.guard_enabled and dllm and self.guard_train_rounds == 2):
+                raise ValueError('Base supervision requires two-round GUARD dLLM')
+            if gradient_checkpointing:
+                raise ValueError('Base supervision requires gradient_checkpointing=False '
+                                 'to preserve per-round routing context during backward')
+        # §6.1 total loss: L = L_dLLM + λ_clean L_clean + λ_gate L_gate
+        # + λ_risk L_risk.  The gate regularizer L_gate (route entropy +
+        # effective rank bound) is computed on the round k+1 gate_scale
+        # when guard_train_rounds >= 2.  Default 0 = no regularizer.
+        self.guard_gate_regularizer_weight = float(
+            guard_gate_regularizer_weight)
+        # Cache for the most recent gate_scale tensor (used by L_gate).
+        self._guard_last_gate_scale = None
+        if self.guard_enabled:
+            from src.models.dllm.guard import GuardContext
+            self.guard_context = GuardContext()
+            self._guard_load_risk_head(
+                risk_head_path=guard_risk_head_path,
+                hidden_size_hint=guard_risk_head_hidden,
+                proj_hidden=guard_risk_head_proj_hidden,
+                state_dim=guard_risk_head_state_dim,
+            )
+
+        image_token_id = -1
+        canonical_mask_token_id = -1
+        if self.tokenizer is not None:
+            token_ids = register_harmon_tokens(self.tokenizer, self.llm)
+            image_token_id = token_ids.image_token_id
+            canonical_mask_token_id = token_ids.mask_token_id
+        elif mask_token_strategy == 'canonical':
+            raise ValueError(
+                'canonical mask strategy requires a tokenizer')
+
+        active_mask_token_id = (
+            canonical_mask_token_id
+            if mask_token_strategy == 'canonical'
+            else int(legacy_mask_token_id)
+        )
+        self.register_buffer(
+            'harmon_image_token_id',
+            torch.tensor(image_token_id, dtype=torch.long),
+        )
+        self.register_buffer(
+            'harmon_canonical_mask_token_id',
+            torch.tensor(canonical_mask_token_id, dtype=torch.long),
+        )
+        self.register_buffer(
+            'harmon_legacy_mask_token_id',
+            torch.tensor(int(legacy_mask_token_id), dtype=torch.long),
+        )
+        self.register_buffer(
+            'harmon_mask_token_id',
+            torch.tensor(active_mask_token_id, dtype=torch.long),
+        )
         self.dllm = dllm
         self.min_mask_rate = min_mask_rate
         self.max_mask_rate = max_mask_rate
@@ -52,10 +437,13 @@ class HarmonDev(Harmon, BaseModel):
         self.debuged = False
         self._input_require_grads_enabled = False
 
-        if pretrained_pth is not None:
-            pretrained_state_dict = guess_load_checkpoint(pretrained_pth)
-            info = self.load_state_dict(pretrained_state_dict, strict=False)
-            print_log(f'Load pretrained weight from {pretrained_pth}')
+        # NOTE: ``pretrained_pth`` is loaded *after* LoRA + Guard setup below,
+        # not here.  S1 stable checkpoints are saved AFTER ``get_peft_model``
+        # wraps the LLM, so their state_dict keys look like
+        # ``llm.base_model.model.model.layers.0.self_attn.q_proj.lora_A.*``
+        # (after ``guess_load_checkpoint`` strips the DDP ``module.`` prefix).
+        # Loading them here, before ``_setup_lora``, would silently fail to
+        # match the unwrapped LLM's parameter names and drop the LoRA weights.
 
         # Freeze specific modules
         if freeze_llm:
@@ -94,8 +482,65 @@ class HarmonDev(Harmon, BaseModel):
             self.proj_out.requires_grad_(False)
             print_log('Frozen proj_out')
 
+        self.mask_token_delta = None
+        if trainable_mask_delta:
+            if self.mask_token_strategy != 'canonical':
+                raise ValueError(
+                    'trainable_mask_delta requires canonical strategy')
+            self.mask_token_delta = TrainableMaskDelta.from_embeddings(
+                self.llm.get_input_embeddings(),
+                mask_token_id=int(self.harmon_mask_token_id.item()),
+                legacy_mask_token_id=int(
+                    self.harmon_legacy_mask_token_id.item()),
+            )
+
+        self.dllm_valid_logit_mask = None
+        if self.mask_invalid_dllm_logits:
+            if self.tokenizer is None:
+                raise ValueError(
+                    'mask_invalid_dllm_logits requires a tokenizer')
+            valid_token_ids = harmon_token_support(
+                self.tokenizer
+            ).output_token_ids
+            output_rows = int(
+                self.llm.get_output_embeddings().weight.shape[0])
+            self.dllm_valid_logit_mask = ValidLogitMask(
+                vocab_size=output_rows,
+                valid_token_ids=valid_token_ids,
+                forbidden_token_ids=(
+                    int(self.harmon_image_token_id.item()),
+                    int(self.harmon_canonical_mask_token_id.item()),
+                    int(self.harmon_legacy_mask_token_id.item()),
+                ),
+            )
+
         if lora is not None:
             self._setup_lora(lora)
+
+        # MMEngine calls ``model.init_weights()`` after construction.  PEFT
+        # forwards that call to the wrapped Hugging Face model, which resets
+        # every LoRA adapter (and any RankGate children) after the hot-start
+        # below.  Retain the audited load contract so ``init_weights`` can
+        # restore the checkpoint after all framework initializers have run.
+        self._pretrained_pth_after_init = pretrained_pth
+        self._pretrained_required_key_groups_after_init = tuple(
+            pretrained_required_key_groups)
+
+        # Load pretrained weights AFTER LoRA + Guard setup so the state_dict
+        # keys match: S1 checkpoints were saved with ``module.`` prefix (DDP)
+        # + ``llm.base_model.model...`` (PEFT) + ``guard_rank_gate.*`` (Guard).
+        # The loader below strips a retained DDP prefix and fails when zero
+        # keys match. ``strict=False`` then tolerates (a) missing
+        # ``guard_rank_gate.*`` keys when hot-starting
+        # from a non-GUARD checkpoint (kept at zero-init so s=1 at step 0),
+        # (b) ``vae.*`` keys filtered out by ``HarmonDev.state_dict``, and
+        # (c) any other surplus keys in the checkpoint.
+        if pretrained_pth is not None:
+            _load_pretrained_weights(
+                self,
+                pretrained_pth,
+                required_key_groups=pretrained_required_key_groups,
+            )
 
         # gradient checkpointing
         if gradient_checkpointing:
@@ -126,6 +571,28 @@ class HarmonDev(Harmon, BaseModel):
         lora_config = LoraConfig(**lora_config_dict)
         self.llm = get_peft_model(self.llm, lora_config)
 
+        # GUARD: install RankGate on every LoRA layer (spec §5.6).
+        # At init the gate produces s=1 (static baseline), so enabling this
+        # alone does not change the loss curve.
+        if self.guard_enabled:
+            from src.models.dllm.guard import GuardedLoRAManager
+            lora_rank = int(lora_config_dict.get('r', 16))
+            self.guard_lora_manager = GuardedLoRAManager(
+                self.llm,
+                rank=lora_rank,
+                submodel=self.guard_submodel,
+            )
+            for _name, _gate in self.guard_lora_manager.gates.items():
+                _gate = _gate.to(self.llm.device)
+                for _p in _gate.parameters():
+                    _p.requires_grad = True
+            gate_params = sum(
+                p.numel() for p in self.guard_lora_manager.gate_parameters())
+            print_log(
+                f'GUARD: submodel={self.guard_submodel}, '
+                f'{len(self.guard_lora_manager.gates)} LoRA layers, '
+                f'{gate_params} gate params.')
+
         trainable_params = sum(
             parameter.numel()
             for parameter in self.llm.parameters()
@@ -154,9 +621,37 @@ class HarmonDev(Harmon, BaseModel):
     def state_dict(self, *args, **kwargs):
         state_dict = super().state_dict(*args, **kwargs)
         state_dict = {k: v for k, v in state_dict.items()
-                      if 'vae.' not in k}
+                      if ('vae.' not in k
+                          and not k.startswith((
+                              'mrfc_critic_ensemble.',
+                              'module.mrfc_critic_ensemble.',
+                          )))}
 
         return state_dict
+
+    def init_weights(self):
+        """Run framework initialization, then restore audited hot-starts."""
+        super().init_weights()
+        # Hugging Face initializers also visit the Linear layers nested in
+        # RankGate and overwrite their identity-preserving zero output layer.
+        # Restore the gradient-live identity state first; a future checkpoint
+        # containing trained gates is loaded immediately afterwards and wins.
+        guard_manager = getattr(self, 'guard_lora_manager', None)
+        if guard_manager is not None:
+            for gate in guard_manager.gates.values():
+                gate.reset_identity_parameters()
+        pretrained_pth = getattr(
+            self, '_pretrained_pth_after_init', None)
+        if pretrained_pth is not None:
+            _load_pretrained_weights(
+                self,
+                pretrained_pth,
+                required_key_groups=getattr(
+                    self,
+                    '_pretrained_required_key_groups_after_init',
+                    (),
+                ),
+            )
 
     def train(self: T, mode: bool = True) -> T:
         super().train(mode=mode)
@@ -182,7 +677,221 @@ class HarmonDev(Harmon, BaseModel):
 
         return loss
 
-    def image2text_loss(self, data_dict):
+    def _guard_load_risk_head(
+        self,
+        *,
+        risk_head_path: Optional[str],
+        hidden_size_hint: Optional[int],
+        proj_hidden: int,
+        state_dim: int,
+    ) -> None:
+        """Load the frozen RiskHead (§5.4'.2) used for trajectory evidence.
+
+        The risk head is produced by ``scripts/train_risk_head.py`` on the
+        risk-fit split and is frozen during GUARD training.  It is used to
+        compute the trajectory evidence scalar ``g_hat_i^k`` from the
+        §5.4'.1 trajectory features at each round.
+        """
+        if risk_head_path is None:
+            # RiskHead not provided; the lagged evidence will be ``None``
+            # (treated as zero by the RankGate, i.e. neutral gate).
+            return
+        import os
+        if not os.path.isfile(risk_head_path):
+            raise FileNotFoundError(
+                f'guard_risk_head_path not found: {risk_head_path}'
+            )
+        from src.models.dllm.guard import RiskHead, IsotonicCalibrator
+        ckpt = torch.load(risk_head_path, map_location='cpu')
+        hidden_size = int(
+            ckpt.get('hidden_size', hidden_size_hint or self.llm.config.hidden_size)
+        )
+        head = RiskHead(
+            hidden_size=hidden_size,
+            state_dim=int(ckpt.get('state_dim', state_dim)),
+            proj_hidden=int(ckpt.get('proj_hidden', proj_hidden)),
+        )
+        missing, unexpected = head.load_state_dict(
+            ckpt['state_dict'], strict=False)
+        if missing:
+            # Only the temperature buffer may be missing on legacy checkpoints.
+            head.temperature.fill_(float(ckpt.get('temperature', 1.0)))
+        head = head.to(self.device).eval()
+        for p in head.parameters():
+            p.requires_grad = False
+        self._guard_risk_head = head
+        # Load isotonic calibrator if present (post-hoc calibration, §5.5').
+        if ckpt.get('iso_xs') is not None and ckpt.get('iso_ys') is not None:
+            iso = IsotonicCalibrator()
+            iso._xs = ckpt['iso_xs'].cpu()
+            iso._ys = ckpt['iso_ys'].cpu()
+            self._guard_isotonic = iso
+        print_log(
+            f'GUARD: loaded frozen RiskHead from {risk_head_path} '
+            f'(hidden={hidden_size}, T={head.temperature.item():.4f}, '
+            f'iso={self._guard_isotonic is not None})'
+        )
+
+    @torch.no_grad()
+    def _guard_compute_trajectory_features(
+        self,
+        output,
+        state: torch.Tensor,
+        response_mask: torch.Tensor,
+    ):
+        """Compute the §5.4'.1 trajectory features from an LLM forward.
+
+        Parameters
+        ----------
+        output:
+            LLM forward output (``last_hidden_state`` on the response).
+        state:
+            Corruption state ``(t, u, h)`` for this round, shape
+            ``[batch, 3]``.
+        response_mask:
+            Boolean mask of active response positions, shape
+            ``[batch, seq]``.
+
+        Returns
+        -------
+        TrajectoryFeatures
+        """
+        from src.models.dllm.guard.risk_control import (
+            compute_trajectory_features,
+        )
+        last_hidden = output.last_hidden_state  # [batch, seq, hidden]
+        # Build logits for the active response positions.
+        logits = self.llm.get_output_embeddings()(last_hidden)
+        if self.dllm_valid_logit_mask is not None:
+            logits = self.dllm_valid_logit_mask(logits)
+        # Only score positions that are part of the response (active mask).
+        # We still compute features everywhere; the manager slices evidence
+        # to the LoRA input window.  The committed_history is maintained
+        # across rounds by the caller via ``self._guard_committed_history``.
+        committed_history = self._guard_committed_history
+        if committed_history is None or committed_history.shape != (
+            last_hidden.shape[0], last_hidden.shape[1]
+        ):
+            committed_history = torch.zeros(
+                last_hidden.shape[0], last_hidden.shape[1],
+                dtype=torch.bool, device=last_hidden.device,
+            )
+        remask = torch.zeros_like(committed_history)
+        features = compute_trajectory_features(
+            hidden=last_hidden,
+            logits=logits,
+            prev_probs=self._guard_prev_logits,
+            prev_candidates=self._guard_prev_candidates,
+            committed_history=committed_history,
+            remask=remask,
+            state=state,
+            block_size=self.block_size,
+        )
+        # Cache prev_* for the next round's JS / stability computation.
+        self._guard_prev_logits = F.softmax(logits.float(), dim=-1).detach()
+        self._guard_prev_candidates = features.candidates.detach()
+        return features
+
+    @torch.no_grad()
+    def _guard_update_lagged_evidence(self, output, state, response_mask=None):
+        """Update lagged trajectory evidence from LLM forward output.
+
+        Spec §5.4'.2 / §5.6: the frozen RiskHead consumes the §5.4'.1
+        trajectory features at round ``k`` and produces the scalar
+        ``g_hat_i^k`` (shape ``[batch, seq, 1]``), stop-gradiented before it
+        enters the round ``k+1`` RankGate.
+        """
+        if self._guard_risk_head is None:
+            self._guard_lagged_evidence = None
+            return
+        features = self._guard_compute_trajectory_features(
+            output, state, response_mask
+        )
+        g_hat = self._guard_risk_head(
+            features.hidden,
+            features.confidence,
+            features.entropy,
+            features.js_div,
+            features.stable,
+            features.committed_history.float(),
+            features.remask.float(),
+            features.block_commit_corr,
+            features.state,
+        )  # [batch, seq, 1]
+        if self._guard_isotonic is not None:
+            # Apply post-hoc isotonic calibration (§5.5').
+            g_hat = self._guard_isotonic.transform(g_hat).view_as(g_hat)
+        self._guard_lagged_evidence = g_hat.detach()
+
+    def _guard_gate_regularizer(self) -> torch.Tensor:
+        """Live second-round penalty, zero at uniform routing.
+
+        Detached diagnostic caches cannot train the gate. The live cache is
+        consumed BEFORE manager.reset(); only the scalar loss survives reset.
+        """
+        mgr = getattr(self, 'guard_lora_manager', None)
+        scales = getattr(mgr, 'regularizer_scales', {})
+        if not scales:
+            return torch.zeros((), device=self.device, dtype=torch.float32)
+        terms, counts = [], []
+        for scale in scales.values():
+            energy = scale.float().square()
+            p = energy / energy.sum(-1, keepdim=True).clamp_min(1e-8)
+            rank = p.shape[-1]
+            entropy = -(p * p.clamp_min(1e-8).log()).sum(-1)
+            # amax distributes gradients at ties; max would select one atom.
+            penalty = (1 - entropy / math.log(rank) + p.amax(-1) - 1 / rank
+                       if rank > 1 else p.sum(-1) * 0)
+            terms.append(penalty.sum())
+            counts.append(penalty.numel())
+        return torch.stack(terms).sum() / sum(counts)
+
+    def dllm_token_loss(
+        self,
+        last_hidden_state,
+        labels,
+        loss_mask,
+        response_mask,
+        sample_weights=None,
+    ):
+        active_mask = loss_mask & response_mask & labels.ne(-100)
+        selected_hidden = last_hidden_state[active_mask]
+        selected_labels = labels[active_mask]
+        logits = self.llm.get_output_embeddings()(selected_hidden)
+        if self.dllm_valid_logit_mask is not None:
+            logits = self.dllm_valid_logit_mask(logits)
+        if sample_weights is not None:
+            if (not torch.is_tensor(sample_weights)
+                    or sample_weights.ndim != 1
+                    or sample_weights.shape[0] != labels.shape[0]):
+                raise ValueError(
+                    'visnec_weight must align with the image2text batch')
+            sample_weights = sample_weights.to(
+                device=last_hidden_state.device, dtype=torch.float32)
+            if (not torch.isfinite(sample_weights).all()
+                    or bool((sample_weights < 0.5).any())
+                    or bool((sample_weights > 1.5).any())):
+                raise ValueError(
+                    'visnec_weight must be finite in [0.5, 1.5]')
+            token_losses = F.cross_entropy(
+                logits.float(), selected_labels, reduction='none')
+            active_rows = active_mask.nonzero(as_tuple=False)[:, 0]
+            sums = token_losses.new_zeros(labels.shape[0])
+            counts = token_losses.new_zeros(labels.shape[0])
+            sums.scatter_add_(0, active_rows, token_losses)
+            counts.scatter_add_(
+                0, active_rows, torch.ones_like(token_losses))
+            valid_samples = counts.gt(0)
+            if not bool(valid_samples.any()):
+                return logits.sum() * 0.0
+            per_sample = sums[valid_samples] / counts[valid_samples]
+            weights = sample_weights[valid_samples]
+            return (per_sample * weights).sum() / weights.sum()
+        if self.safe_dllm_loss:
+            return safe_token_cross_entropy(logits, selected_labels)
+        return F.cross_entropy(input=logits, target=selected_labels)
+
+    def _image2text_loss_result(self, data_dict):
         input_ids = data_dict['input_ids'].to(self.device)
         attention_mask = data_dict['attention_mask'].to(self.device)
         # 获取 dLLM 特有的 masks (如果存在)
@@ -198,6 +907,25 @@ class HarmonDev(Harmon, BaseModel):
         position_ids = data_dict.get('position_ids', None)
         if position_ids is not None:
             position_ids = position_ids.to(self.device)
+
+        block_indices = data_dict.get('block_indices', None)
+        if block_indices is not None:
+            block_indices = block_indices.to(self.device)
+
+        state_features = data_dict.get('corruption_state_features')
+        state_mask = data_dict.get('corruption_state_mask')
+        if self.dllm_state_conditioner is not None and self.dllm:
+            if state_features is None or state_mask is None:
+                raise ValueError(
+                    'enabled state conditioner requires packed '
+                    'CorruptionState features and mask'
+                )
+            state_features = state_features.to(
+                device=self.device, dtype=torch.float32
+            )
+            state_mask = state_mask.to(
+                device=self.device, dtype=torch.bool
+            )
 
         labels = data_dict['labels'].to(self.device)
         pixel_values = data_dict.get('pixel_values', None)
@@ -292,10 +1020,65 @@ class HarmonDev(Harmon, BaseModel):
                 after_pos = position_ids[:, 4:] + 1087
                 position_ids = torch.cat([position_ids[:, :3], image_pos_ids, after_pos], dim=1)
 
+            if state_features is not None:
+                state_features = torch.cat(
+                    (
+                        state_features[:, :3],
+                        torch.zeros(
+                            state_features.shape[0],
+                            1088,
+                            state_features.shape[-1],
+                            dtype=state_features.dtype,
+                            device=state_features.device,
+                        ),
+                        state_features[:, 4:],
+                    ),
+                    dim=1,
+                )
+                state_mask = torch.cat(
+                    (
+                        state_mask[:, :3],
+                        torch.zeros(
+                            state_mask.shape[0],
+                            1088,
+                            dtype=torch.bool,
+                            device=state_mask.device,
+                        ),
+                        state_mask[:, 4:],
+                    ),
+                    dim=1,
+                )
+
+            if block_indices is not None:
+                block_indices = torch.cat(
+                    (
+                        block_indices[:, :3],
+                        torch.zeros(
+                            block_indices.shape[0],
+                            1088,
+                            dtype=block_indices.dtype,
+                            device=block_indices.device,
+                        ),
+                        block_indices[:, 4:],
+                    ),
+                    dim=1,
+                )
+
             inputs_embeds = z_enc.new_zeros(*input_ids.shape, self.llm.config.hidden_size)
             inputs_embeds[input_ids == IMAGE_TOKEN_INDEX] = z_enc.flatten(0, 1)
             inputs_embeds[input_ids != IMAGE_TOKEN_INDEX] = self.llm.get_input_embeddings()(
                 input_ids[input_ids != IMAGE_TOKEN_INDEX])
+            if self.mask_token_delta is not None:
+                inputs_embeds = self.mask_token_delta(
+                    inputs_embeds,
+                    input_ids,
+                )
+            if self.dllm_state_conditioner is not None:
+                inputs_embeds = self.dllm_state_conditioner(
+                    inputs_embeds,
+                    state_features,
+                    state_mask,
+                )
             loss_null = 0.0
 
         if getattr(self, "dllm", False) and attention_mask.dtype == torch.bool:
@@ -312,17 +1095,185 @@ class HarmonDev(Harmon, BaseModel):
         if getattr(self, "dllm", False) and position_ids is not None:
             llm_kwargs['position_ids'] = position_ids
 
-        output = self.llm_model(**llm_kwargs)
+        # GUARD §6.1 multi-round training forward path.
+        #
+        # ``guard_train_rounds`` selects the cost/innovation trade-off:
+        #   * ``1`` = legacy single forward.  Lagged evidence is ``None``
+        #     on the first round, so RankGate returns ``s=1`` explicitly and
+        #     receives no routing gradient. This is the S1 stable fallback.
+        #   * ``>=2`` = §6.1 multi-round training.  Round k (teacher)
+        #     produces ``g_hat_i^k`` from frozen RiskHead; round k+1
+        #     (student) consumes the lagged evidence, so RankGate uses
+        #     ``s = 1 + beta*tanh(f_l(state_{k+1}, g_hat_i^k))`` and
+        #     ``raw_beta`` gets a non-trivial gradient.  Cost = Kx
+        #     main-model forward (within §1's 1.5-2.0x budget for K=2).
+        #
+        # Per-batch lagged caches are reset at the start to avoid
+        # cross-sample leakage (spec §12.1 "lagged context 对错样本").
+        guard_mgr = getattr(self, 'guard_lora_manager', None)
+        guard_multi = (
+            guard_mgr is not None
+            and self.guard_train_rounds >= 2
+            and self.dllm
+        )
+        base_weight = getattr(self, 'guard_base_loss_weight', 0.0)
+        original_mask_loss = None
+        # Original (round-k) corruption state built from the batch.
+        if guard_mgr is not None:
+            # Reset per-batch lagged caches to avoid cross-sample leakage.
+            self._guard_lagged_evidence = None
+            self._guard_prev_logits = None
+            self._guard_prev_candidates = None
+            self._guard_committed_history = None
+            if state_features is not None and state_mask is not None:
+                guard_state = state_features.to(
+                    device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+                mask_f = state_mask.to(
+                    device=inputs_embeds.device, dtype=guard_state.dtype
+                ).unsqueeze(-1)
+                denom = mask_f.sum(dim=1).clamp(min=1.0)
+                guard_state_k = (guard_state * mask_f).sum(dim=1) / denom
+            else:
+                guard_state_k = torch.zeros(
+                    inputs_embeds.shape[0], 3,
+                    device=inputs_embeds.device, dtype=inputs_embeds.dtype,
+                )
+        else:
+            guard_state_k = None
+
+        if not guard_multi:
+            # Legacy single-forward path (S1 stable baseline).  RankGate
+            # runs with ``evidence=None`` (zero evidence -> s=1).
+            if guard_mgr is not None:
+                guard_mgr.set_round_context(
+                    state=guard_state_k,
+                    evidence=None,
+                    routing_enabled=self.tracer_router_enabled,
+                )
+            output = self.llm_model(**llm_kwargs)
+            if guard_mgr is not None:
+                guard_mgr.reset()
+        else:
+            # §6.1 multi-round training.  Round k = teacher forward that
+            # produces lagged evidence; round k+1 = student forward that
+            # consumes it and produces the dLLM loss.
+            #
+            # Round k uses the existing ``inputs_embeds`` (already built
+            # from the batch's corruption state) with ``evidence=None``
+            # (first round, neutral gate, s=1, §5.6). The opt-in base
+            # objective supervises the ORIGINAL mask before any commits.
+            guard_mgr.set_round_context(
+                state=guard_state_k,
+                evidence=None,
+                routing_enabled=self.tracer_router_enabled,
+            )
+            with torch.set_grad_enabled(torch.is_grad_enabled() and base_weight > 0.0):
+                output_k = self.llm_model(**llm_kwargs)
+            guard_mgr.reset()
+            if base_weight > 0.0:
+                if loss_mask is None:
+                    raise ValueError('Base supervision requires the original loss_mask')
+                original_mask_loss = self.dllm_token_loss(
+                    output_k.last_hidden_state, labels, loss_mask,
+                    response_mask, data_dict.get('visnec_weight'))
+            # Build per-token lagged evidence ``g_hat_i^k`` from round k.
+            # This calls the frozen RiskHead under no_grad, so both the
+            # LLM hidden states and RiskHead weights are detached.
+            with torch.no_grad():
+                resp_mask_k = None
+                if response_mask is not None:
+                    resp_mask_k = response_mask.to(
+                        device=inputs_embeds.device, dtype=torch.bool)
+                self._guard_update_lagged_evidence(
+                    output_k, guard_state_k, response_mask=resp_mask_k)
+                # Snapshot committed_history so round k+1 sees the
+                # actual commit history from round k (all-False on round
+                # 0 since the teacher path doesn't commit).
+                committed_k = self._guard_committed_history
+                if committed_k is None:
+                    committed_k = torch.zeros(
+                        inputs_embeds.shape[0], inputs_embeds.shape[1],
+                        dtype=torch.bool,
+                        device=inputs_embeds.device,
+                    )
+                    self._guard_committed_history = committed_k
+            # Round k+1 uses a real adjacent token state: each response block
+            # commits its fixed-schedule fraction of the teacher's most
+            # confident candidates. Reusing the identical masked embeddings
+            # while only changing (t,u,h) would be a train/inference mismatch.
+            if response_mask is None or block_indices is None:
+                raise ValueError(
+                    'TRACER multi-round training requires response_mask and '
+                    'block_indices')
+            if self.dllm_state_conditioner is not None:
+                raise ValueError(
+                    'TRACER paired-token training currently requires the '
+                    'state conditioner to be disabled')
+            from src.models.dllm.guard import (
+                advance_corruption_state,
+                advance_masked_tokens,
+            )
+            # Teacher candidates and discrete commits never receive gradients.
+            # In particular, do not retain the full-vocabulary logits graph
+            # when direct first-round supervision is enabled.
+            with torch.no_grad():
+                logits_k = self.llm.get_output_embeddings()(
+                    output_k.last_hidden_state)
+                if self.dllm_valid_logit_mask is not None:
+                    logits_k = self.dllm_valid_logit_mask(logits_k)
+                student_ids, teacher_commit_mask = advance_masked_tokens(
+                    input_ids=input_ids,
+                    logits=logits_k,
+                    response_mask=response_mask,
+                    block_indices=block_indices,
+                    mask_token_id=int(self.harmon_mask_token_id.item()),
+                    committed_fraction=1.0 / max(int(self.block_size), 1),
+                )
+            del logits_k, output_k
+            student_inputs_embeds = inputs_embeds.clone()
+            if bool(teacher_commit_mask.any()):
+                committed_embeddings = self.llm.get_input_embeddings()(
+                    student_ids[teacher_commit_mask])
+                student_inputs_embeds[teacher_commit_mask] = (
+                    committed_embeddings.to(student_inputs_embeds.dtype))
+                # A committed token is now visible in the student input and
+                # is no longer a masked-denoising target at round k+1.
+                # Keeping it in the loss would leak the target token through
+                # the bidirectional student representation.
+                if loss_mask is not None:
+                    loss_mask = loss_mask & ~teacher_commit_mask
+            llm_kwargs_student = dict(llm_kwargs)
+            llm_kwargs_student['inputs_embeds'] = student_inputs_embeds
+
+            guard_state_kp1 = advance_corruption_state(
+                guard_state_k,
+                committed_fraction=1.0 / max(int(self.block_size), 1),
+            )
+            guard_mgr.set_round_context(
+                state=guard_state_kp1,
+                evidence=self._guard_lagged_evidence,
+                routing_enabled=self.tracer_router_enabled,
+                capture_regularizer=self.guard_gate_regularizer_weight > 0.0,
+            )
+            try:
+                output = self.llm_model(**llm_kwargs_student)
+                if self.guard_gate_regularizer_weight > 0.0:
+                    loss_gate = self._guard_gate_regularizer()
+            finally:
+                guard_mgr.reset()
 
         if getattr(self, "dllm", False):
-            logits2keep = data_dict['loss_mask'] & data_dict['response_mask']
             last_hidden_state = output.last_hidden_state#[:, :-1]
-            # labels = labels[:, 1:]
-            last_hidden_state = last_hidden_state[logits2keep]
-            labels = labels[logits2keep]
-            logits = self.llm.get_output_embeddings()(last_hidden_state)
-
-            loss_i2t = F.cross_entropy(input=logits, target=labels)
+            loss_i2t = self.dllm_token_loss(
+                last_hidden_state,
+                labels,
+                loss_mask,
+                response_mask,
+                data_dict.get('visnec_weight'),
+            )
+            if original_mask_loss is not None:
+                loss_i2t = (base_weight * original_mask_loss
+                            + (1.0 - base_weight) * loss_i2t)
         else:
             last_hidden_state = output.last_hidden_state[:, :-1]
             labels = labels[:, 1:]
@@ -332,7 +1283,667 @@ class HarmonDev(Harmon, BaseModel):
 
             loss_i2t = F.cross_entropy(input=logits, target=labels)
 
-        return loss_i2t + loss_null
+        # §6.1 total loss: L = L_dLLM + λ_gate L_gate.
+        # L_gate is only added when the gate actually routed (multi-round
+        # path).  λ_gate = self.guard_gate_regularizer_weight (default 0).
+        if guard_multi and self.guard_gate_regularizer_weight > 0.0:
+            loss_i2t = loss_i2t + self.guard_gate_regularizer_weight * loss_gate
+
+        # Optional online-commit extension. Historical models never enter this
+        # branch. Pass the *expanded* layout and already encoded image; the
+        # extension must not reconstruct RoPE positions or expose clean targets.
+        commit_forward = getattr(self, '_commit_training_forward', None)
+        if commit_forward is not None:
+            commit_forward(
+                inputs_embeds=inputs_embeds, input_ids=input_ids,
+                attention_mask=attention_mask, position_ids=position_ids,
+                labels=labels, response_mask=response_mask,
+                block_indices=block_indices,
+            )
+
+        return _Image2TextLossResult(
+            base_loss=loss_i2t + loss_null,
+            last_hidden_state=last_hidden_state,
+            response_mask=response_mask,
+            loss_mask=loss_mask,
+        )
+
+    def image2text_loss(self, data_dict):
+        """Return the historical scalar image-to-text loss."""
+        return self._image2text_loss_result(data_dict).base_loss
+
+    @staticmethod
+    def _mrare_diagnostic(reference, value):
+        return reference.detach().new_tensor(float(value), dtype=torch.float32)
+
+    def _mrare_zero_auxiliary(
+        self,
+        reference,
+        diagnostics=None,
+    ):
+        diagnostics = dict(diagnostics or {})
+        connected_zero = reference.sum() * 0.0
+        result = {
+            'weighted_positive': connected_zero,
+            'weighted_rank': connected_zero,
+            'weighted_distill': connected_zero,
+        }
+        for name in self._mrare_diagnostic_names():
+            result[name] = self._mrare_diagnostic(
+                reference, diagnostics.get(name, 0))
+        return result
+
+    @staticmethod
+    def _mrare_diagnostic_names():
+        return (
+            'mrare_valid_count',
+            'mrare_invalid_count',
+            'mrare_empty_relevance_count',
+            'mrare_invalid_vocab_count',
+            'mrare_invalid_condition_count',
+            'mrare_invalid_energy_count',
+            'mrare_nonfinite_target_count',
+            'mrare_distill_active_count',
+            'mrare_distill_inactive_count',
+        )
+
+    def _mrare_auxiliary_losses(
+        self,
+        data_dict,
+        last_hidden_state,
+        response_mask,
+        loss_mask,
+    ):
+        """Compute answer-conditioned paired representation losses.
+
+        Structural batch violations fail with their field name. Invalid cache
+        records and inactive distillation positions are excluded with detached
+        reason diagnostics and backward-connected finite zeros.
+        """
+        from .dllm.mrare import mrare_losses, paired_reverse_energy
+        required_keys = (
+            'mrare_valid',
+            'mrare_target_pixel_values',
+            'mrare_relevance_mask',
+            'mrare_positive_condition_ids',
+            'mrare_positive_condition_mask',
+            'mrare_negative_condition_ids',
+            'mrare_negative_condition_mask',
+            'mrare_changed_response_offset',
+            'mrare_changed_condition_offset',
+            'mrare_positive_token_id',
+            'mrare_negative_token_id',
+            'mrare_energy_scale',
+        )
+        if last_hidden_state.ndim != 3:
+            raise ValueError(
+                'last_hidden_state must have shape [batch, sequence, hidden]')
+        batch_size = int(last_hidden_state.shape[0])
+        for key in required_keys:
+            if key not in data_dict:
+                raise ValueError(f'MR-ARE batch is missing required field {key}')
+
+        def _require_tensor(key, ndim):
+            value = data_dict[key]
+            if not torch.is_tensor(value):
+                raise ValueError(f'{key} must be a tensor')
+            if value.ndim != ndim:
+                raise ValueError(f'{key} must have {ndim} dimensions')
+            if value.shape[0] != batch_size:
+                raise ValueError(f'{key} must align with batch size')
+            return value.to(device=last_hidden_state.device)
+
+        valid = _require_tensor('mrare_valid', 1)
+        if valid.dtype != torch.bool:
+            raise ValueError('mrare_valid must be a boolean tensor')
+        target_pixels = _require_tensor('mrare_target_pixel_values', 4).to(
+            dtype=self.dtype)
+        relevance = _require_tensor('mrare_relevance_mask', 3)
+        if relevance.dtype != torch.bool:
+            raise ValueError('mrare_relevance_mask must be a boolean tensor')
+        integer_dtypes = {
+            torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+        }
+        positive_ids = _require_tensor('mrare_positive_condition_ids', 2)
+        if positive_ids.dtype not in integer_dtypes:
+            raise ValueError(
+                'mrare_positive_condition_ids must be an integer tensor')
+        positive_ids = positive_ids.to(dtype=torch.long)
+        positive_attention = _require_tensor(
+            'mrare_positive_condition_mask', 2)
+        if positive_attention.dtype != torch.bool:
+            raise ValueError(
+                'mrare_positive_condition_mask must be a boolean tensor')
+        negative_ids = _require_tensor('mrare_negative_condition_ids', 2)
+        if negative_ids.dtype not in integer_dtypes:
+            raise ValueError(
+                'mrare_negative_condition_ids must be an integer tensor')
+        negative_ids = negative_ids.to(dtype=torch.long)
+        negative_attention = _require_tensor(
+            'mrare_negative_condition_mask', 2)
+        if negative_attention.dtype != torch.bool:
+            raise ValueError(
+                'mrare_negative_condition_mask must be a boolean tensor')
+        if positive_attention.shape != positive_ids.shape:
+            raise ValueError(
+                'mrare_positive_condition_mask must match '
+                'mrare_positive_condition_ids shape')
+        if negative_attention.shape != negative_ids.shape:
+            raise ValueError(
+                'mrare_negative_condition_mask must match '
+                'mrare_negative_condition_ids shape')
+        def _require_integer_vector(key):
+            value = _require_tensor(key, 1)
+            if value.dtype not in integer_dtypes:
+                raise ValueError(f'{key} must be an integer tensor')
+            return value.to(dtype=torch.long)
+
+        changed_response_offsets = _require_integer_vector(
+            'mrare_changed_response_offset')
+        changed_condition_offsets = _require_integer_vector(
+            'mrare_changed_condition_offset')
+        positive_token_ids = _require_integer_vector(
+            'mrare_positive_token_id')
+        negative_token_ids = _require_integer_vector(
+            'mrare_negative_token_id')
+        energy_scale = _require_tensor(
+            'mrare_energy_scale', 1).to(dtype=torch.float32)
+
+        if self.mrare_distill_enabled:
+            expected_mask_shape = last_hidden_state.shape[:2]
+            if not torch.is_tensor(response_mask):
+                raise ValueError('response_mask must be a tensor')
+            if response_mask.shape != expected_mask_shape:
+                raise ValueError(
+                    'response_mask must match last_hidden_state sequence shape')
+            if response_mask.dtype != torch.bool:
+                raise ValueError('response_mask must be a boolean tensor')
+            if not torch.is_tensor(loss_mask):
+                raise ValueError('loss_mask must be a tensor')
+            if loss_mask.shape != expected_mask_shape:
+                raise ValueError(
+                    'loss_mask must match last_hidden_state sequence shape')
+            if loss_mask.dtype != torch.bool:
+                raise ValueError('loss_mask must be a boolean tensor')
+            response_mask = response_mask.to(
+                device=last_hidden_state.device, dtype=torch.bool)
+            loss_mask = loss_mask.to(
+                device=last_hidden_state.device, dtype=torch.bool)
+
+        valid_indices = valid.nonzero(as_tuple=False).flatten()
+        diagnostics = {
+            'mrare_invalid_count': batch_size - int(valid_indices.numel()),
+        }
+        if valid_indices.numel() == 0:
+            return self._mrare_zero_auxiliary(
+                last_hidden_state, diagnostics)
+
+        target_pixels = target_pixels.index_select(0, valid_indices)
+        relevance = relevance.index_select(0, valid_indices)
+        positive_ids = positive_ids.index_select(0, valid_indices)
+        positive_attention = positive_attention.index_select(0, valid_indices)
+        negative_ids = negative_ids.index_select(0, valid_indices)
+        negative_attention = negative_attention.index_select(0, valid_indices)
+        changed_response_offsets = changed_response_offsets.index_select(
+            0, valid_indices)
+        changed_condition_offsets = changed_condition_offsets.index_select(
+            0, valid_indices)
+        positive_token_ids = positive_token_ids.index_select(0, valid_indices)
+        negative_token_ids = negative_token_ids.index_select(0, valid_indices)
+        energy_scale = energy_scale.index_select(0, valid_indices)
+
+        positive_lengths = positive_attention.sum(dim=1)
+        negative_lengths = negative_attention.sum(dim=1)
+        positive_expected_mask = (
+            torch.arange(positive_ids.shape[1], device=self.device)
+            .unsqueeze(0) < positive_lengths.unsqueeze(1))
+        negative_expected_mask = (
+            torch.arange(negative_ids.shape[1], device=self.device)
+            .unsqueeze(0) < negative_lengths.unsqueeze(1))
+        condition_offsets_valid = (
+            changed_condition_offsets.ge(0)
+            & changed_condition_offsets.lt(positive_ids.shape[1])
+            & changed_condition_offsets.lt(negative_ids.shape[1])
+        )
+        condition_width = min(
+            positive_ids.shape[1], negative_ids.shape[1])
+        if condition_width > 0:
+            safe_condition_offsets = changed_condition_offsets.clamp(
+                min=0, max=condition_width - 1)
+            row_indices = torch.arange(
+                valid_indices.numel(), device=self.device)
+            condition_offsets_valid &= (
+                positive_attention[row_indices, safe_condition_offsets]
+                & negative_attention[row_indices, safe_condition_offsets]
+                & positive_ids[row_indices, safe_condition_offsets].eq(
+                    positive_token_ids)
+                & negative_ids[row_indices, safe_condition_offsets].eq(
+                    negative_token_ids)
+            )
+        condition_valid = (
+            positive_lengths.gt(0)
+            & negative_lengths.gt(0)
+            & positive_attention.eq(positive_expected_mask).all(dim=1)
+            & negative_attention.eq(negative_expected_mask).all(dim=1)
+            & condition_offsets_valid
+        )
+
+        input_rows = int(self.llm.get_input_embeddings().weight.shape[0])
+        output_rows = int(self.llm.get_output_embeddings().weight.shape[0])
+        positive_vocab_valid = (
+            ((positive_ids >= 0) & (positive_ids < input_rows))
+            | ~positive_attention
+        ).all(dim=1)
+        negative_vocab_valid = (
+            ((negative_ids >= 0) & (negative_ids < input_rows))
+            | ~negative_attention
+        ).all(dim=1)
+        vocab_valid = (
+            positive_vocab_valid
+            & negative_vocab_valid
+            & positive_token_ids.ge(0)
+            & positive_token_ids.lt(output_rows)
+            & negative_token_ids.ge(0)
+            & negative_token_ids.lt(output_rows)
+        )
+        relevance_nonempty = relevance.flatten(1).any(dim=1)
+        if bool((~relevance_nonempty).any()):
+            raise ValueError(
+                'mrare_relevance_mask must be nonempty for every valid record')
+        scale_valid = torch.isfinite(energy_scale) & energy_scale.gt(0)
+        target_finite = torch.isfinite(target_pixels).flatten(1).all(dim=1)
+        usable = (
+            condition_valid
+            & vocab_valid
+            & relevance_nonempty
+            & scale_valid
+            & target_finite
+        )
+        diagnostics.update({
+            'mrare_empty_relevance_count': int(
+                (~relevance_nonempty).sum().item()),
+            'mrare_invalid_vocab_count': int((~vocab_valid).sum().item()),
+            'mrare_invalid_condition_count': int(
+                (~condition_valid).sum().item()),
+            'mrare_invalid_energy_count': int((~scale_valid).sum().item()),
+            'mrare_nonfinite_target_count': int(
+                (~target_finite).sum().item()),
+        })
+        rejected_count = int((~usable).sum().item())
+        diagnostics['mrare_invalid_count'] += rejected_count
+        usable_indices = usable.nonzero(as_tuple=False).flatten()
+        if usable_indices.numel() == 0:
+            return self._mrare_zero_auxiliary(
+                last_hidden_state, diagnostics)
+
+        usable_batch_indices = valid_indices.index_select(0, usable_indices)
+        target_pixels = target_pixels.index_select(0, usable_indices)
+        relevance = relevance.index_select(0, usable_indices)
+        positive_ids = positive_ids.index_select(0, usable_indices)
+        positive_attention = positive_attention.index_select(0, usable_indices)
+        negative_ids = negative_ids.index_select(0, usable_indices)
+        negative_attention = negative_attention.index_select(0, usable_indices)
+        changed_response_offsets = changed_response_offsets.index_select(
+            0, usable_indices)
+        positive_token_ids = positive_token_ids.index_select(0, usable_indices)
+        negative_token_ids = negative_token_ids.index_select(0, usable_indices)
+        energy_scale = energy_scale.index_select(0, usable_indices)
+        positive_ids = positive_ids.masked_fill(~positive_attention, 0)
+        negative_ids = negative_ids.masked_fill(~negative_attention, 0)
+
+        # These modules are fixed in Stable LoRAOpt. Keep autograd enabled
+        # through their operations so conditions can still update LoRA and
+        # proj_in, while ensuring they never acquire MR-ARE gradients.
+        self.vae.requires_grad_(False)
+        self.mar.requires_grad_(False)
+        self.proj_out.requires_grad_(False)
+
+        target_latents_grid = self.encode(target_pixels)
+        if target_latents_grid.ndim != 4:
+            raise ValueError(
+                'mrare_target_pixel_values must encode to a 4D latent grid')
+        item_count, height, width, channels = target_latents_grid.shape
+        target_latents = target_latents_grid.detach().reshape(
+            item_count, height * width, channels)
+        relevance = relevance.reshape(item_count, -1)
+        if relevance.shape[1] != target_latents.shape[1]:
+            raise ValueError(
+                'mrare_relevance_mask must match encoded target latent grid')
+        decoder_mask = relevance.to(dtype=target_latents_grid.dtype)
+        positive_encoding = self.forward_mae_encoder(
+            target_latents_grid,
+            decoder_mask,
+            input_ids=positive_ids,
+            attention_mask=positive_attention,
+        )
+        positive_condition = self.mar.forward_mae_decoder(
+            positive_encoding,
+            decoder_mask,
+            image_shape=(height, width),
+        )
+        if getattr(self, 'mrare_positive_only', False):
+            from src.models.dllm.mrare.reverse_energy import (
+                single_reverse_energy)
+            positive_energy = single_reverse_energy(
+                self.mar, positive_condition, target_latents, relevance)
+            # P1 has no rank or distillation target. A detached placeholder
+            # keeps common diagnostics typed without running any negative MAR
+            # encoder, decoder, or diffusion forward.
+            negative_energy = positive_energy.detach()
+        else:
+            negative_encoding = self.forward_mae_encoder(
+                target_latents_grid,
+                decoder_mask,
+                input_ids=negative_ids,
+                attention_mask=negative_attention,
+            )
+            negative_condition = self.mar.forward_mae_decoder(
+                negative_encoding,
+                decoder_mask,
+                image_shape=(height, width),
+            )
+            positive_energy, negative_energy = paired_reverse_energy(
+                self.mar,
+                positive_condition,
+                negative_condition,
+                target_latents,
+                relevance,
+            )
+
+        finite_energy = (
+            torch.isfinite(positive_energy)
+            & torch.isfinite(negative_energy)
+            & torch.isfinite(energy_scale)
+            & energy_scale.gt(0)
+        )
+        finite_indices = finite_energy.nonzero(as_tuple=False).flatten()
+        nonfinite_energy_count = int((~finite_energy).sum().item())
+        diagnostics['mrare_invalid_energy_count'] += nonfinite_energy_count
+        diagnostics['mrare_invalid_count'] += nonfinite_energy_count
+        if finite_indices.numel() == 0:
+            return self._mrare_zero_auxiliary(
+                last_hidden_state, diagnostics)
+
+        positive_energy = positive_energy.index_select(0, finite_indices)
+        negative_energy = negative_energy.index_select(0, finite_indices)
+        finite_scale = energy_scale.index_select(0, finite_indices)
+        valid_losses = mrare_losses(
+            positive_energy,
+            negative_energy,
+            finite_scale,
+            margin=self.mrare_margin,
+            tau_energy=self.mrare_tau_energy,
+            lambda_positive=self.mrare_lambda_positive,
+            lambda_rank=self.mrare_lambda_rank,
+            lambda_distill=0.0,
+        )
+        weighted_positive = (
+            valid_losses['positive'] * self.mrare_lambda_positive)
+        weighted_rank = valid_losses['rank'] * self.mrare_lambda_rank
+
+        distill_logits = []
+        distill_energy_indices = []
+        distill_inactive_count = 0
+        if self.mrare_distill_enabled and self.mrare_lambda_distill > 0.0:
+            output_embeddings = self.llm.get_output_embeddings()
+            for finite_position, energy_index in enumerate(
+                finite_indices.tolist()
+            ):
+                batch_index = int(
+                    usable_batch_indices[energy_index].item())
+                offset = int(
+                    changed_response_offsets[energy_index].item())
+                response_positions = response_mask[batch_index].nonzero(
+                    as_tuple=False).flatten()
+                if not 0 <= offset < response_positions.numel():
+                    distill_inactive_count += 1
+                    continue
+                position = int(response_positions[offset].item())
+                if not bool(loss_mask[batch_index, position].item()):
+                    distill_inactive_count += 1
+                    continue
+                logits = output_embeddings(
+                    last_hidden_state[batch_index, position])
+                positive_token_id = int(
+                    positive_token_ids[energy_index].item())
+                negative_token_id = int(
+                    negative_token_ids[energy_index].item())
+                distill_logits.append(
+                    (logits[positive_token_id]
+                     - logits[negative_token_id])
+                    / self.mrare_tau_token)
+                distill_energy_indices.append(finite_position)
+
+        connected_zero = last_hidden_state.sum() * 0.0
+        if distill_logits:
+            token_preference_logits = torch.stack(distill_logits)
+            distill_energy_indices = torch.tensor(
+                distill_energy_indices,
+                device=positive_energy.device,
+                dtype=torch.long,
+            )
+            distill_losses = mrare_losses(
+                positive_energy.index_select(0, distill_energy_indices),
+                negative_energy.index_select(0, distill_energy_indices),
+                finite_scale.index_select(0, distill_energy_indices),
+                token_preference_logits=token_preference_logits,
+                margin=self.mrare_margin,
+                tau_energy=self.mrare_tau_energy,
+                lambda_positive=0.0,
+                lambda_rank=0.0,
+                lambda_distill=self.mrare_lambda_distill,
+            )
+            weighted_distill = (
+                distill_losses['distill'] * self.mrare_lambda_distill)
+        else:
+            weighted_distill = connected_zero
+
+        diagnostics.update({
+            'mrare_valid_count': int(finite_indices.numel()),
+            'mrare_distill_active_count': len(distill_logits),
+            'mrare_distill_inactive_count': distill_inactive_count,
+        })
+        result = {
+            'weighted_positive': weighted_positive,
+            'weighted_rank': weighted_rank,
+            'weighted_distill': weighted_distill,
+        }
+        for name in self._mrare_diagnostic_names():
+            result[name] = self._mrare_diagnostic(
+                last_hidden_state, diagnostics.get(name, 0))
+        return result
+
+    def _mrfc_auxiliary_losses(self, data_dict, reference):
+        """Apply the frozen feature-critic to one replay pair per SFT row."""
+        connected_zero = reference.sum() * 0.0
+        if (self.mrfc_lambda_pair == 0.0
+                and self.mrfc_lambda_distill == 0.0):
+            return {
+                'weighted_pair': connected_zero,
+                'weighted_distill': connected_zero,
+                'mrfc_active_pairs': connected_zero.detach(),
+                'mrfc_score_gap': connected_zero.detach(),
+                'mrfc_pair_raw': connected_zero.detach(),
+                'mrfc_distill_raw': connected_zero.detach(),
+            }
+        from .dllm.mrfc import spatial_answer_pool, spatial_visual_pool
+        required = (
+            'mrfc_valid',
+            'mrfc_representation',
+            'mrfc_target_pixel_values',
+            'mrfc_relevance_mask',
+            'mrfc_positive_condition_ids',
+            'mrfc_positive_condition_mask',
+            'mrfc_negative_condition_ids',
+            'mrfc_negative_condition_mask',
+            'mrfc_changed_condition_offset',
+            'mrfc_positive_token_id',
+            'mrfc_negative_token_id',
+        )
+        for key in required:
+            if key not in data_dict:
+                raise ValueError(f'MR-FC batch is missing required field {key}')
+        valid = data_dict['mrfc_valid']
+        if (not torch.is_tensor(valid) or valid.ndim != 1
+                or valid.dtype != torch.bool or not bool(valid.all())):
+            raise ValueError('MR-FC replay must mark every SFT row valid')
+        batch_size = int(valid.shape[0])
+        representations = data_dict['mrfc_representation']
+        if (not isinstance(representations, (list, tuple))
+                or len(representations) != batch_size
+                or not set(representations).issubset({'rgb', 'depth', 'seg'})):
+            raise ValueError('MR-FC representation assignment is invalid')
+
+        def _tensor(key, ndim, dtype=None):
+            value = data_dict[key]
+            if (not torch.is_tensor(value) or value.ndim != ndim
+                    or value.shape[0] != batch_size):
+                raise ValueError(
+                    f'{key} must have {ndim} dimensions and align with batch')
+            value = value.to(device=self.device)
+            return value.to(dtype=dtype) if dtype is not None else value
+
+        target_pixels = _tensor(
+            'mrfc_target_pixel_values', 4, self.dtype)
+        relevance = _tensor('mrfc_relevance_mask', 3)
+        if relevance.dtype != torch.bool:
+            raise ValueError('mrfc_relevance_mask must be boolean')
+        positive_ids = _tensor(
+            'mrfc_positive_condition_ids', 2, torch.long)
+        positive_mask = _tensor('mrfc_positive_condition_mask', 2)
+        negative_ids = _tensor(
+            'mrfc_negative_condition_ids', 2, torch.long)
+        negative_mask = _tensor('mrfc_negative_condition_mask', 2)
+        if positive_mask.dtype != torch.bool or negative_mask.dtype != torch.bool:
+            raise ValueError('MR-FC condition masks must be boolean')
+        changed_offsets = _tensor(
+            'mrfc_changed_condition_offset', 1, torch.long)
+        positive_token_ids = _tensor(
+            'mrfc_positive_token_id', 1, torch.long)
+        negative_token_ids = _tensor(
+            'mrfc_negative_token_id', 1, torch.long)
+
+        width = max(positive_ids.shape[1], negative_ids.shape[1])
+        if positive_ids.shape[1] != width:
+            pad = width - positive_ids.shape[1]
+            positive_ids = F.pad(positive_ids, (0, pad), value=0)
+            positive_mask = F.pad(positive_mask, (0, pad), value=False)
+        if negative_ids.shape[1] != width:
+            pad = width - negative_ids.shape[1]
+            negative_ids = F.pad(negative_ids, (0, pad), value=0)
+            negative_mask = F.pad(negative_mask, (0, pad), value=False)
+        row = torch.arange(batch_size, device=self.device)
+        safe_offset = changed_offsets.clamp(min=0, max=max(width - 1, 0))
+        offsets_valid = changed_offsets.gt(0) & changed_offsets.lt(width)
+        if width:
+            offsets_valid &= (
+                positive_mask[row, safe_offset]
+                & negative_mask[row, safe_offset]
+                & positive_ids[row, safe_offset].eq(positive_token_ids)
+                & negative_ids[row, safe_offset].eq(negative_token_ids)
+            )
+        changed_positions = (
+            positive_ids.ne(negative_ids) & positive_mask & negative_mask)
+        offsets_valid &= changed_positions.sum(dim=1).eq(1)
+        if width:
+            offsets_valid &= changed_positions[row, safe_offset]
+        if not bool(offsets_valid.all()):
+            raise ValueError('MR-FC condition pair contract is invalid')
+        if (not torch.isfinite(target_pixels).all()
+                or not bool(relevance.flatten(1).any(dim=1).all())
+                or not bool((~relevance.flatten(1)).any(dim=1).all())):
+            raise ValueError('MR-FC target or relevance mask is invalid')
+
+        target_grid = self.encode(target_pixels)
+        if target_grid.ndim != 4:
+            raise ValueError('MR-FC target must encode to a spatial grid')
+        _, height, width_grid, _ = target_grid.shape
+        visible_mask = torch.zeros(
+            batch_size, height * width_grid,
+            device=self.device, dtype=target_grid.dtype)
+        base_visual, projected_visual = self.extract_visual_feature(
+            target_grid, mask=visible_mask, detach=False)
+        if relevance.flatten(1).shape[1] != height * width_grid:
+            raise ValueError('MR-FC relevance mask does not match target grid')
+
+        condition_ids = torch.cat([positive_ids, negative_ids], dim=0)
+        condition_mask = torch.cat([positive_mask, negative_mask], dim=0)
+        projected_pair = torch.cat(
+            [projected_visual, projected_visual], dim=0)
+        inputs = self.prepare_forward_input(
+            x=projected_pair,
+            input_ids=condition_ids,
+            attention_mask=condition_mask,
+        )
+        output = self.llm_model(**inputs, return_dict=True)
+        llm_visual = output.last_hidden_state[:, -projected_pair.shape[1]:]
+        buffer_size = int(self.mar.buffer_size)
+        llm_visual = torch.cat([
+            llm_visual[:, -buffer_size:],
+            llm_visual[:, :-buffer_size],
+        ], dim=1)
+        base_spatial = base_visual[:, buffer_size:].float()
+        answer_spatial = llm_visual[:, buffer_size:].float()
+        positive_spatial = answer_spatial[:batch_size]
+        negative_spatial = answer_spatial[batch_size:]
+        flat_relevance = relevance.reshape(batch_size, -1)
+        visual_features = spatial_visual_pool(
+            base_spatial, flat_relevance)
+        positive_features = spatial_answer_pool(
+            positive_spatial, flat_relevance)
+        negative_features = spatial_answer_pool(
+            negative_spatial, flat_relevance)
+
+        gap_by_index = {}
+        for representation in ('rgb', 'depth', 'seg'):
+            indices = [index for index, assigned in enumerate(representations)
+                       if assigned == representation]
+            if not indices:
+                continue
+            selected = torch.tensor(
+                indices, device=self.device, dtype=torch.long)
+            positive_score, negative_score = (
+                self.mrfc_critic_ensemble.score_pair(
+                    representation,
+                    visual_features.index_select(0, selected),
+                    positive_features.index_select(0, selected),
+                    negative_features.index_select(0, selected),
+                ))
+            for local_index, batch_index in enumerate(indices):
+                gap_by_index[batch_index] = (
+                    positive_score[local_index] - negative_score[local_index])
+        critic_gap = torch.stack([
+            gap_by_index[index] for index in range(batch_size)])
+        pair_raw = F.softplus(self.mrfc_margin - critic_gap).mean()
+
+        # The changed token is predicted from the identical causal prefix.
+        # Critic confidence is stop-gradiented before becoming the soft target.
+        prefix_offsets = changed_offsets - 1
+        prefix_hidden = output.last_hidden_state[
+            row, prefix_offsets]
+        token_logits = self.llm.get_output_embeddings()(prefix_hidden)
+        positive_logits = token_logits[row, positive_token_ids]
+        negative_logits = token_logits[row, negative_token_ids]
+        token_gap = positive_logits - negative_logits
+        critic_target = torch.sigmoid(
+            critic_gap.detach().float() / self.mrfc_tau_critic)
+        distill_raw = F.binary_cross_entropy_with_logits(
+            token_gap.float(), critic_target)
+
+        finite = torch.stack([
+            pair_raw.float(), distill_raw.float(), critic_gap.float().mean()])
+        if not torch.isfinite(finite).all():
+            raise FloatingPointError('MR-FC produced a non-finite loss or score')
+        return {
+            'weighted_pair': pair_raw * self.mrfc_lambda_pair,
+            'weighted_distill': (
+                distill_raw * self.mrfc_lambda_distill),
+            'mrfc_active_pairs': pair_raw.detach().new_tensor(
+                float(batch_size)),
+            'mrfc_score_gap': critic_gap.detach().mean(),
+            'mrfc_pair_raw': pair_raw.detach(),
+            'mrfc_distill_raw': distill_raw.detach(),
+        }
 
     def recon_loss(self, data_dict):
 
@@ -734,7 +2345,8 @@ class HarmonDev(Harmon, BaseModel):
         return start_idx, end_idx
 
     def _sample_block_times(self, num_blocks: int, device: torch.device, *, low: float, high: float) -> torch.Tensor:
-        t = torch.rand(num_blocks, device=device).clamp(low, high)
+        # ``low``/``high`` are mask probabilities; t = 1 - mask_prob (plan §3.1).
+        t = 1.0 - torch.rand(num_blocks, device=device).clamp(low, high)
         if num_blocks > 0:
             offset = torch.arange(num_blocks, device=device, dtype=t.dtype) / num_blocks
             t = t / num_blocks + offset
@@ -792,7 +2404,20 @@ class HarmonDev(Harmon, BaseModel):
 
         return mask.unsqueeze(0).unsqueeze(0)
     
-    def create_dllm_batch(self, data_dict, mask_token_id=151671, pad_token_id=151645):
+    def create_dllm_batch(
+        self,
+        data_dict,
+        mask_token_id=None,
+        pad_token_id=None,
+    ):
+        if mask_token_id is None:
+            mask_token_id = int(self.harmon_mask_token_id.item())
+        if pad_token_id is None:
+            pad_token_id = (
+                self.tokenizer.eos_token_id
+                if self.tokenizer is not None
+                else 151645
+            )
         block_size = getattr(self, "block_size", 32)
 
         for key in data_dict.keys():
@@ -808,16 +2433,23 @@ class HarmonDev(Harmon, BaseModel):
             batch_t_types, batch_b_indices = [], []
             batch_response_mask, batch_loss_mask = [], [] # 【新增】：容器
             batch_position_ids = []  # 【新增】：per-sample position_ids，用于对齐 clean/noisy
+            batch_corruption_states = []
             batch_lengths = []
             batch_t = []
+            active_targets = 0
+            legitimate_empty_responses = 0
+            unexpected_empty_masked_nonempty = 0
 
             for i in range(bsz):
                 i_ids = input_ids_list[i].clone()
                 l_ids = labels_list[i].clone()
+                response_corruption_state = None
                 
-                try:
-                    start_idx, end_idx = self.find_response_span(i_ids)
-                except ValueError:
+                start_idx, end_idx = self.find_response_span(i_ids)
+                if start_idx is None or end_idx is None:
+                    if self.enforce_nonempty_dllm_targets:
+                        raise ValueError(
+                            'missing assistant response span in dLLM batch')
                     start_idx, end_idx = 0, 0
                     
                 len_res = end_idx - start_idx
@@ -859,6 +2491,65 @@ class HarmonDev(Harmon, BaseModel):
                     )
                     batch_t.append(t_tensor)
 
+                    stable_noisy_ids = None
+                    if self.enforce_nonempty_dllm_targets:
+                        token_times = t_tensor.repeat_interleave(block_size)
+                        response_random_values = torch.rand(
+                            len_res, device=clean_resp_ids.device
+                        )
+                        corruptor = MaskedCorruptor(
+                            mask_token_id=mask_token_id,
+                            enforce_nonempty=True,
+                            excluded_token_ids=(
+                                IMAGE_TOKEN_INDEX,
+                                int(self.harmon_image_token_id.item()),
+                            ),
+                        )
+                        stable_noisy_ids, response_corruption_state = (
+                            corruptor.corrupt(
+                                clean_resp_ids,
+                                clean_resp_labels,
+                                t=token_times,
+                                random_values=response_random_values,
+                            )
+                        )
+                        response_corruption_state.require_valid_supervision()
+                        force_flags = data_batch.get(
+                            'mrare_force_changed_token')
+                        valid_flags = data_batch.get('mrare_valid')
+                        changed_offsets = data_batch.get(
+                            'mrare_changed_response_offset')
+                        force_this = (
+                            self.mrare_force_changed_token
+                            and torch.is_tensor(force_flags)
+                            and torch.is_tensor(valid_flags)
+                            and torch.is_tensor(changed_offsets)
+                            and bool(force_flags[i].item())
+                            and bool(valid_flags[i].item())
+                        )
+                        if force_this:
+                            changed_offset = int(changed_offsets[i].item())
+                            if (changed_offset < 0
+                                    or changed_offset >= clean_resp_ids.numel()
+                                    or clean_resp_labels[changed_offset].item() < 0):
+                                raise ValueError(
+                                    'formal changed response offset is invalid')
+                            stable_noisy_ids[changed_offset] = mask_token_id
+                            active_mask = (
+                                response_corruption_state.active_mask.clone())
+                            valid_target_mask = (
+                                response_corruption_state.valid_target_mask.clone())
+                            active_mask[changed_offset] = True
+                            valid_target_mask[changed_offset] = True
+                            response_corruption_state = replace(
+                                response_corruption_state,
+                                active_mask=active_mask,
+                                valid_target_mask=valid_target_mask,
+                            )
+                            response_corruption_state.require_valid_supervision()
+                        if response_corruption_state.legitimate_empty:
+                            legitimate_empty_responses += 1
+
                     diff_i_ids_blocks, diff_l_ids_blocks = [], []
                     diff_t_types_blocks, diff_b_indices_blocks = [], []
                     diff_resp_mask_blocks, diff_loss_mask_blocks = [], [] # 【新增】：Block级Mask容器
@@ -870,17 +2561,24 @@ class HarmonDev(Harmon, BaseModel):
                         b_clean_ids = clean_resp_ids[b_start:b_end]
                         b_clean_labels = clean_resp_labels[b_start:b_end]
                         
-                        b_t = t_tensor[b_idx].item()
-                        b_mask_prob = 1.0 - b_t
-                        
-                        b_rand_vals = torch.rand(block_size, device=self.device)
-                        b_mask_idx = b_rand_vals < b_mask_prob
-                        
-                        if b_idx == n_blocks - 1 and pad_len > 0:
-                            b_mask_idx[-pad_len:] = False
-                        
-                        b_noisy_ids = b_clean_ids.clone()
-                        b_noisy_ids[b_mask_idx] = mask_token_id
+                        if self.enforce_nonempty_dllm_targets:
+                            b_noisy_ids = stable_noisy_ids[b_start:b_end]
+                            b_mask_idx = (
+                                response_corruption_state.active_mask[
+                                    b_start:b_end
+                                ]
+                            )
+                        else:
+                            b_rand_vals = torch.rand(
+                                block_size, device=self.device
+                            )
+                            b_t = t_tensor[b_idx].item()
+                            b_mask_prob = 1.0 - b_t
+                            b_mask_idx = b_rand_vals < b_mask_prob
+                            if b_idx == n_blocks - 1 and pad_len > 0:
+                                b_mask_idx[-pad_len:] = False
+                            b_noisy_ids = b_clean_ids.clone()
+                            b_noisy_ids[b_mask_idx] = mask_token_id
                         
                         # 组装当前 Block 基础属性
                         diff_i_ids_blocks.append(b_noisy_ids)
@@ -917,6 +2615,19 @@ class HarmonDev(Harmon, BaseModel):
                     sample_resp_mask = torch.cat([ar_response_mask, diff_response_mask])
                     sample_loss_mask = torch.cat([ar_loss_mask, diff_loss_mask])
                     batch_lengths.append((start_idx, len_res))
+                    valid_active = (
+                        sample_resp_mask
+                        & sample_loss_mask
+                        & sample_l_ids.ne(-100)
+                    )
+                    sample_active_count = int(valid_active.sum().item())
+                    active_targets += sample_active_count
+                    has_valid_target = bool(clean_resp_labels.ne(-100).any())
+                    if has_valid_target and sample_active_count == 0:
+                        unexpected_empty_masked_nonempty += 1
+                        if self.enforce_nonempty_dllm_targets:
+                            raise RuntimeError(
+                                'nonempty response has zero active targets')
                 else:
                     # 兜底：没有找到回复的情况
                     batch_t.append(torch.empty(0, dtype=torch.float32, device=self.device))
@@ -929,6 +2640,7 @@ class HarmonDev(Harmon, BaseModel):
                     sample_resp_mask = torch.zeros_like(sample_i_ids, dtype=torch.bool)
                     sample_loss_mask = torch.zeros_like(sample_i_ids, dtype=torch.bool)
                     batch_lengths.append((len(sample_i_ids), 0))
+                    legitimate_empty_responses += 1
 
                 # 【新增】：构造 position_ids，让 noisy 段与 clean 段共享位置编码，
                 # 消除 RoPE 在 clean/noisy 上的位置偏移，保证训练与推理分布一致。
@@ -945,6 +2657,9 @@ class HarmonDev(Harmon, BaseModel):
                 batch_response_mask.append(sample_resp_mask) # 【新增】
                 batch_loss_mask.append(sample_loss_mask)     # 【新增】
                 batch_position_ids.append(sample_pos_ids)    # 【新增】
+                batch_corruption_states.append(
+                    response_corruption_state
+                )
 
             # ==========================================
             # Batch 级别的统一 Padding
@@ -960,6 +2675,27 @@ class HarmonDev(Harmon, BaseModel):
             data_batch['t'] = pad_sequence(batch_t, batch_first=True, padding_value=1.0)
             # 【新增】：position_ids padding 用 0，padded 位置本身不参与 attention（被 attention_mask 屏蔽）
             data_batch['position_ids'] = pad_sequence(batch_position_ids, batch_first=True, padding_value=0)
+            data_batch['corruption_states'] = batch_corruption_states
+            # Pack corruption state features for the state conditioner and/or
+            # the GUARD RankGate (plan §3.3, §8.3).
+            if (self.dllm_state_conditioner is not None
+                    or getattr(self, 'guard_enabled', False)):
+                state_features, state_mask = (
+                    pack_corruption_state_features(
+                        batch_corruption_states,
+                        data_batch['token_types'],
+                        fields=self.state_conditioner_fields,
+                    )
+                )
+                data_batch['corruption_state_features'] = state_features
+                data_batch['corruption_state_mask'] = state_mask
+            data_batch['dllm_stats'] = {
+                'active_targets': active_targets,
+                'legitimate_empty_responses': legitimate_empty_responses,
+                'unexpected_empty_masked_nonempty': (
+                    unexpected_empty_masked_nonempty
+                ),
+            }
             
             batch_max_len = data_batch['input_ids'].shape[1]
             batch_attn_masks = []
@@ -990,8 +2726,13 @@ class HarmonDev(Harmon, BaseModel):
         block_size=None,
         denoising_steps=None,
         temperature=0.0,
-        mask_token_id=151671,
-        eos_token_id=151645,
+        mask_token_id=None,
+        eos_token_id=None,
+        guard_risk_commit: Optional[bool] = None,
+        tracer_router_enabled: Optional[bool] = None,
+        tracer_policy_enabled: Optional[bool] = None,
+        trajectory_records: Optional[list] = None,
+        runtime_diagnostics=None,
     ):
         """Block Diffusion 推理解码。
 
@@ -1016,6 +2757,24 @@ class HarmonDev(Harmon, BaseModel):
             block_size = getattr(self, 'block_size', 32)
         if denoising_steps is None:
             denoising_steps = block_size
+        if mask_token_id is None:
+            mask_token_id = int(self.harmon_mask_token_id.item())
+        if eos_token_id is None:
+            eos_token_id = (
+                self.tokenizer.eos_token_id
+                if self.tokenizer is not None
+                else 151645
+            )
+        if tracer_router_enabled is None:
+            tracer_router_enabled = bool(getattr(
+                self, 'tracer_router_enabled', True))
+        if tracer_policy_enabled is None:
+            tracer_policy_enabled = bool(getattr(
+                self, 'tracer_policy_enabled', True))
+        # Backward-compatible call sites can still supply the historical
+        # flag. New TRACER scripts use the two independent switches above.
+        if guard_risk_commit is not None:
+            tracer_policy_enabled = bool(guard_risk_commit)
 
         device = self.device
         dtype = self.dtype
@@ -1025,7 +2784,54 @@ class HarmonDev(Harmon, BaseModel):
 
         num_blocks = (max_new_tokens + block_size - 1) // block_size
 
+        # GUARD §5.6/§5.7: build per-round corruption states from the
+        # transfer schedule and a CommitRevisionPolicy for risk-aware
+        # commit.  Both are only enabled when guard_lora_manager is
+        # installed and a frozen RiskHead is available.  When the risk
+        # head is missing the policy falls back to confidence top-k, so
+        # behaviour matches the original generate_dllm.
+        guard_mgr = getattr(self, 'guard_lora_manager', None)
+        guard_has_risk = (
+            guard_mgr is not None and self._guard_risk_head is not None)
+        guard_trace_enabled = (
+            guard_mgr is not None
+            and (guard_has_risk or trajectory_records is not None)
+        )
+        if guard_mgr is not None:
+            from src.models.dllm.guard.risk_control import (
+                CommitRevisionPolicy,
+                transfer_schedule_to_mask_probs,
+            )
+            transfer_schedule = self._transfer_schedule(
+                block_size, denoising_steps)
+            round_states = transfer_schedule_to_mask_probs(
+                transfer_schedule, block_size
+            ).to(device)  # [K, 3]
+            commit_policy = CommitRevisionPolicy(block_size=block_size)
+            guard_state_clean = torch.tensor(
+                [[1.0, -math.log(1e-6), 0.0]] * batch_size,
+                device=device, dtype=dtype,
+            )
+        else:
+            transfer_schedule = self._transfer_schedule(
+                block_size, denoising_steps)
+            round_states = None
+            commit_policy = None
+            guard_state_clean = None
+
         # ---------- 1. Prefix 编码，构建初始 KV Cache ----------
+        if guard_mgr is not None:
+            # Prefix forward uses the clean endpoint state (no lagged
+            # evidence yet, §5.6).
+            guard_mgr.set_round_context(
+                state=guard_state_clean,
+                evidence=None,
+                routing_enabled=tracer_router_enabled,
+            )
+            self._guard_lagged_evidence = None
+            self._guard_prev_logits = None
+            self._guard_prev_candidates = None
+            self._guard_committed_history = None
         output = self.llm_model(
             inputs_embeds=inputs_embeds,
             past_key_values=DynamicCache(),
@@ -1033,15 +2839,16 @@ class HarmonDev(Harmon, BaseModel):
             return_dict=True,
         )
         kv_cache = output.past_key_values
-
-        # 计算每步去噪应固定的 token 数
-        transfer_schedule = self._transfer_schedule(block_size, denoising_steps)
+        if guard_mgr is not None:
+            guard_mgr.reset()
 
         all_block_ids = []
         finished = False
 
         # ---------- 2. 逐块生成 ----------
         for b_idx in range(num_blocks):
+            if runtime_diagnostics is not None:
+                runtime_diagnostics.record_block_started()
             # 当前块的 position_ids（与训练一致，contiguous from prefix_len + offset）
             block_start_pos = prefix_len + b_idx * block_size
             block_pos_ids = torch.arange(
@@ -1064,13 +2871,58 @@ class HarmonDev(Harmon, BaseModel):
                 dtype=dtype, device=device,
             )
 
+            # Per-block lagged state. Evidence is token-position-specific and
+            # is reset at every new block, so each block's first round is
+            # neutral and starts without committed tokens.
+            current_committed_block = torch.zeros(
+                batch_size, block_size, dtype=torch.bool, device=device,
+            )
+            ever_committed_block = torch.zeros_like(current_committed_block)
+            remask_block = torch.zeros_like(current_committed_block)
+            prev_probs_block = None
+            prev_candidates_block = None
+            # Evidence is token-position-specific, so it never crosses a
+            # block boundary. The first round of every block is neutral.
+            lagged_evidence_block = None
+            cumulative_target = 0
+
             # ---------- 3. 块内迭代去噪 ----------
             for step in range(denoising_steps):
                 is_mask = (block_ids == mask_token_id)
                 if not is_mask.any():
                     break
+                if runtime_diagnostics is not None:
+                    runtime_diagnostics.record_round_started()
+
+                # Snapshot round k's lagged evidence before the forward
+                # computes g_hat^k. Both the RankGate and commit policy for
+                # this round consume exactly g_hat^(k-1).
+                round_lagged_evidence = lagged_evidence_block
+
+                # GUARD §5.6: feed the round-k state + lagged evidence to
+                # the RankGate before the LLM forward.
+                if guard_mgr is not None and round_states is not None:
+                    state_k = round_states[step].unsqueeze(0).expand(
+                        batch_size, -1).to(device=device, dtype=dtype)
+                    # Lagged evidence is per-token from the previous round;
+                    # every block resets it, so each block's first round sees
+                    # ``None``.
+                    ev = (round_lagged_evidence
+                          if round_lagged_evidence is not None
+                          else None)
+                    guard_mgr.set_round_context(
+                        state=state_k,
+                        evidence=ev,
+                        routing_enabled=tracer_router_enabled,
+                    )
 
                 block_embeds = self.llm.get_input_embeddings()(block_ids)
+                mask_token_delta = getattr(self, 'mask_token_delta', None)
+                if mask_token_delta is not None:
+                    block_embeds = mask_token_delta(
+                        block_embeds,
+                        block_ids,
+                    )
 
                 out = self.llm_model(
                     inputs_embeds=block_embeds,
@@ -1085,9 +2937,118 @@ class HarmonDev(Harmon, BaseModel):
                 # 用公开 API 裁剪并同步 cache 的内部长度记账。
                 kv_cache.crop(cache_len)
 
+                if runtime_diagnostics is not None and guard_mgr is not None:
+                    runtime_diagnostics.record_gate_scales(
+                        getattr(guard_mgr, 'last_gate_scales', {}).values(),
+                        active=(
+                            bool(tracer_router_enabled)
+                            and round_lagged_evidence is not None
+                        ),
+                    )
+                if guard_mgr is not None:
+                    guard_mgr.reset()
+
                 logits = self.llm.get_output_embeddings()(
                     out.last_hidden_state
                 )  # [batch, block_size, vocab]
+                valid_logit_mask = getattr(
+                    self, 'dllm_valid_logit_mask', None
+                )
+                if valid_logit_mask is not None:
+                    logits = valid_logit_mask(logits)
+
+                # Compute §5.4'.1 trajectory features for this round, so
+                # the frozen RiskHead can produce g_hat for the next
+                # round's RankGate and (optionally) the commit policy.
+                features = None
+                g_hat = None
+                if guard_trace_enabled:
+                    from src.models.dllm.guard.risk_control import (
+                        compute_trajectory_features,
+                    )
+                    state_k_for_feats = (
+                        round_states[step].unsqueeze(0).expand(
+                            batch_size, -1
+                        ).to(device)
+                        if round_states is not None
+                        else guard_state_clean
+                    )
+                    features = compute_trajectory_features(
+                        hidden=out.last_hidden_state,
+                        logits=logits,
+                        prev_probs=prev_probs_block,
+                        prev_candidates=prev_candidates_block,
+                        committed_history=ever_committed_block,
+                        remask=remask_block,
+                        state=state_k_for_feats,
+                        block_size=block_size,
+                    )
+                    if guard_has_risk:
+                        g_hat = self._guard_risk_head(
+                            features.hidden,
+                            features.confidence,
+                            features.entropy,
+                            features.js_div,
+                            features.stable,
+                            features.committed_history.float(),
+                            features.remask.float(),
+                            features.block_commit_corr,
+                            features.state,
+                        )  # [batch, block_size, 1]
+                        if self._guard_isotonic is not None:
+                            g_hat = self._guard_isotonic.transform(
+                                g_hat).view_as(g_hat)
+                        g_hat = g_hat.detach()
+                        if runtime_diagnostics is not None:
+                            runtime_diagnostics.record_risk(g_hat)
+                        # Lagged: round k evidence controls round k+1 gate.
+                        lagged_evidence_block = g_hat
+                        self._guard_lagged_evidence = g_hat
+
+                # Trajectory recording hook: when a list is provided,
+                # snapshot all §5.4'.1 features + metadata for offline
+                # RiskHead training.  This lets the collector use the
+                # EXACT inference code path (guard-enabled, RankGate
+                # active, lagged evidence flowing), eliminating the
+                # train-inference distribution mismatch that caused
+                # §5.7 to produce <10% when enabled.
+                trajectory_record = None
+                if trajectory_records is not None and features is not None:
+                    trajectory_record = {
+                        'block_idx': b_idx,
+                        'step': step,
+                        'block_start': block_start_pos,
+                        'block_end': block_start_pos + block_size,
+                        'block_size': block_size,
+                        'is_first_round': prev_probs_block is None,
+                        'hidden': out.last_hidden_state[
+                            :, :block_size].detach().cpu(),
+                        'confidence': features.confidence.detach().cpu(),
+                        'entropy': features.entropy.detach().cpu(),
+                        'js_div': features.js_div.detach().cpu(),
+                        'stable': features.stable.detach().cpu(),
+                        'current_committed_before': (
+                            current_committed_block.clone().cpu()),
+                        'committed_history': (
+                            ever_committed_block.clone().cpu()),
+                        'remask': remask_block.clone().cpu(),
+                        'block_commit_corr': (
+                            features.block_commit_corr.detach().cpu()),
+                        'state': state_k_for_feats.detach().cpu(),
+                        'candidates': features.candidates.detach().cpu(),
+                        'risk': (
+                            None if g_hat is None
+                            else g_hat.detach().cpu()),
+                        'policy_risk': (
+                            None
+                            if (not tracer_policy_enabled
+                                or round_lagged_evidence is None)
+                            else round_lagged_evidence.detach().cpu()),
+                        'tracer_router_enabled': bool(
+                            tracer_router_enabled),
+                        'tracer_policy_enabled': bool(
+                            tracer_policy_enabled),
+                    }
 
                 # 采样
                 if temperature > 0:
@@ -1101,26 +3062,110 @@ class HarmonDev(Harmon, BaseModel):
                     sampled_conf = F.softmax(logits, dim=-1).max(dim=-1).values
                     sampled_ids = logits.argmax(dim=-1)
 
-                # 仅对仍为 mask 的位置计算置信度
-                neg_inf = torch.tensor(float('-inf'), device=device)
-                confidence = torch.where(is_mask, sampled_conf, neg_inf)
-
-                # 选择 top-k 置信度最高的 token 固定
+                # 选择本轮固定的 token：risk-aware commit (§5.7) 或
+                # confidence top-k fallback。
                 num_to_fix = transfer_schedule[step]
-                transfer_mask = torch.zeros_like(block_ids, dtype=torch.bool)
-                for j in range(batch_size):
-                    n_masked = is_mask[j].sum().item()
-                    k = min(num_to_fix, n_masked)
-                    if k > 0:
-                        _, topk_idx = torch.topk(confidence[j], k)
-                        transfer_mask[j, topk_idx] = True
+                cumulative_target += int(num_to_fix)
+                if features is not None and commit_policy is not None:
+                    from src.models.dllm.guard.risk_control import (
+                        apply_commit_revision,
+                    )
+                    decision = commit_policy.select_committed(
+                        features=features,
+                        target_committed_count=cumulative_target,
+                        prev_committed=current_committed_block,
+                        # The exact lagged tensor routed into this round's
+                        # RankGate is also consumed by the policy. No second
+                        # RiskHead call and no same-round evidence leakage.
+                        risk_scores=(
+                            round_lagged_evidence
+                            if tracer_policy_enabled else None),
+                        risk_head=None,
+                    )
+                    if runtime_diagnostics is not None:
+                        used_risk = bool(
+                            tracer_policy_enabled
+                            and round_lagged_evidence is not None
+                        )
+                        runtime_diagnostics.record_policy_decision(
+                            decision, used_risk=used_risk)
+                        if not used_risk:
+                            if round_lagged_evidence is None:
+                                fallback_reason = 'first_round'
+                            elif not tracer_policy_enabled:
+                                fallback_reason = 'policy_disabled'
+                            else:
+                                fallback_reason = 'risk_unavailable'
+                            runtime_diagnostics.record_confidence_fallback(
+                                fallback_reason)
+                    block_ids = apply_commit_revision(
+                        block_ids=block_ids,
+                        sampled_ids=sampled_ids,
+                        mask_token_id=mask_token_id,
+                        decision=decision,
+                    )
+                    current_committed_block = decision.committed_mask
+                    remask_block = decision.remask_mask
+                else:
+                    if runtime_diagnostics is not None:
+                        runtime_diagnostics.record_confidence_fallback(
+                            'guard_unavailable')
+                    neg_inf = torch.tensor(float('-inf'), device=device)
+                    confidence = torch.where(
+                        is_mask, sampled_conf, neg_inf)
+                    new_commit_mask = torch.zeros_like(
+                        block_ids, dtype=torch.bool)
+                    for j in range(batch_size):
+                        n_masked = int(is_mask[j].sum().item())
+                        k = min(num_to_fix, n_masked)
+                        if k > 0:
+                            _, topk_idx = torch.topk(confidence[j], k)
+                            new_commit_mask[j, topk_idx] = True
+                    if runtime_diagnostics is not None:
+                        runtime_diagnostics.record_fallback_commits(
+                            new_commit_mask, current_committed_block)
+                    block_ids = torch.where(
+                        new_commit_mask, sampled_ids, block_ids)
+                    current_committed_block = (
+                        current_committed_block | new_commit_mask)
+                    remask_block = torch.zeros_like(
+                        current_committed_block)
 
-                block_ids = torch.where(transfer_mask, sampled_ids, block_ids)
+                ever_committed_block = (
+                    ever_committed_block | current_committed_block)
 
-            # 处理残留 mask（极少情况下最后一步可能仍有 mask）
+                if trajectory_record is not None:
+                    trajectory_record.update({
+                        'target_committed_count': cumulative_target,
+                        'current_committed_after': (
+                            current_committed_block.clone().cpu()),
+                        'new_commit': (
+                            decision.new_commit_mask.clone().cpu()
+                            if features is not None and commit_policy is not None
+                            else new_commit_mask.clone().cpu()),
+                        'remask_after': remask_block.clone().cpu(),
+                    })
+                    trajectory_records.append(trajectory_record)
+
+                # Update prev_* for the next round's JS / stability.
+                if features is not None:
+                    prev_probs_block = F.softmax(
+                        logits.float(), dim=-1).detach()
+                    prev_candidates_block = features.candidates.detach()
+                else:
+                    prev_probs_block = F.softmax(
+                        logits.float(), dim=-1).detach()
+                    prev_candidates_block = sampled_ids.detach()
+
+            # Fixed-NFE invariant: the final cumulative budget must fill the
+            # block. Silent EOS substitution would hide an invalid run.
             residual_mask = (block_ids == mask_token_id)
             if residual_mask.any():
-                block_ids[residual_mask] = eos_token_id
+                raise RuntimeError(
+                    'TRACER fixed-NFE invariant violated: residual mask '
+                    f'after {denoising_steps} steps')
+            if runtime_diagnostics is not None:
+                runtime_diagnostics.record_block_completed()
 
             all_block_ids.append(block_ids)
 
@@ -1173,6 +3218,16 @@ class HarmonDev(Harmon, BaseModel):
 
     def compute_loss(self, data_dict):
         if self.dllm: data_dict = self.create_dllm_batch(data_dict)
+        dllm_stats = {
+            'active_targets': 0,
+            'legitimate_empty_responses': 0,
+            'unexpected_empty_masked_nonempty': 0,
+        }
+        if self.dllm and self.enforce_nonempty_dllm_targets:
+            for batch_data in data_dict.values():
+                for name, value in batch_data.get('dllm_stats', {}).items():
+                    if name in dllm_stats:
+                        dllm_stats[name] += int(value)
 
         losses = {}
         # actual_start_idx, end_idx = self.find_response_span(data_dict['image2text']['input_ids'][0])
@@ -1181,8 +3236,47 @@ class HarmonDev(Harmon, BaseModel):
                 loss = self.text2image_loss(batch_data)
                 losses[f'loss_{data_type}'] = loss * self.loss_weights.get(data_type, 1.0)
             elif 'image2text' in data_type:
-                loss = self.image2text_loss(batch_data)
-                losses[f'loss_{data_type}'] = loss * self.loss_weights.get(data_type, 1.0)
+                if (getattr(self, 'mrare_enabled', False)
+                        or getattr(self, 'mrfc_enabled', False)):
+                    result = self._image2text_loss_result(batch_data)
+                    losses[f'loss_{data_type}'] = (
+                        result.base_loss
+                        * self.loss_weights.get(data_type, 1.0))
+                if getattr(self, 'mrare_enabled', False):
+                    auxiliary = self._mrare_auxiliary_losses(
+                        batch_data,
+                        result.last_hidden_state,
+                        result.response_mask,
+                        result.loss_mask,
+                    )
+                    losses['loss_mrare_positive'] = (
+                        auxiliary['weighted_positive'])
+                    losses['loss_mrare_rank'] = auxiliary['weighted_rank']
+                    if self.mrare_distill_enabled:
+                        losses['loss_mrare_distill'] = (
+                            auxiliary['weighted_distill'])
+                    for name in self._mrare_diagnostic_names():
+                        losses[name] = auxiliary[name]
+                if getattr(self, 'mrfc_enabled', False):
+                    mrfc = self._mrfc_auxiliary_losses(
+                        batch_data, result.last_hidden_state)
+                    losses['loss_mrfc_pair'] = mrfc['weighted_pair']
+                    losses['loss_mrfc_distill'] = mrfc['weighted_distill']
+                    for name in (
+                        'mrfc_active_pairs',
+                        'mrfc_score_gap',
+                        'mrfc_pair_raw',
+                        'mrfc_distill_raw',
+                    ):
+                        losses[name] = mrfc[name]
+                if (not getattr(self, 'mrare_enabled', False)
+                        and not getattr(self, 'mrfc_enabled', False)):
+                    # Preserve the stable image-to-text path exactly when
+                    # both auxiliary methods are disabled, including its RNG
+                    # consumption.
+                    loss = self.image2text_loss(batch_data)
+                    losses[f'loss_{data_type}'] = (
+                        loss * self.loss_weights.get(data_type, 1.0))
             elif 'recon' in data_type:
                 loss = self.recon_loss(batch_data)
                 losses[f'loss_{data_type}'] = loss * self.loss_weights.get(data_type, 1.0)
@@ -1210,4 +3304,11 @@ class HarmonDev(Harmon, BaseModel):
                 losses[f'loss_{data_type}_depth'] = loss_depth * w_depth * w_joint
             else:
                 raise NotImplementedError(f"Unknown data type: {data_type}")
+
+        if self.dllm and self.enforce_nonempty_dllm_targets:
+            reference = next(iter(losses.values()), self.harmon_mask_token_id)
+            for name, value in dllm_stats.items():
+                losses[f'dllm_{name}'] = reference.detach().new_tensor(
+                    float(value), dtype=torch.float32
+                )
         return losses

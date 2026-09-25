@@ -12,12 +12,19 @@ with read_base():
     from .processors import prompt_template, tokenizer, image_size, pad_index, image_length
 
 
-# Data under repo-relative ../data/... (run training from repository root, e.g. via train.sh).
-data_root = '../data/LLaVA-Instruct-150K/'
-data_path = '../data/LLaVA-Instruct-150K/llava_v1_5_mix665k.json'
-image_folder = '../data/LLaVA-Instruct-150K/tuning_data'
-depth_folder = '../data/LLaVA-Instruct-150K/tuning_data_depth'
-mask_folder = '../data/LLaVA-Instruct-150K/tuning_data_mask'
+# Keep the historical NVMe layout as the default, but make the dataset root
+# relocatable.  This is required by the TRACER reproducibility contract: the
+# same content manifest can be verified after copying the data to another
+# machine without editing a Python config.
+data_root = __import__('os').path.abspath(__import__('os').environ.get(
+    'HARMON_DATA_ROOT',
+    '/nvmedata/xiexu/data/LLaVA-Instruct-150K-UniMRG',
+))
+data_path = __import__('os').path.join(
+    data_root, 'llava_v1_5_mix665k.json')
+image_folder = __import__('os').path.join(data_root, 'tuning_data')
+depth_folder = __import__('os').path.join(data_root, 'tuning_data_depth')
+mask_folder = __import__('os').path.join(data_root, 'tuning_data_mask')
 max_length = int(2048 - (336 / 14) ** 2)
 
 # 1. Image-to-Text (SFT) Dataset
@@ -85,7 +92,7 @@ dataset = dict(
 
 group_keys = ['image2text', 'depth', 'recon', 'mask']
 repeat = [1, 1, 1, 1]  # Repeat 1 for all
-batch_size = 32  # Adjust based on GPU memory
+batch_size = 2  # 调试环境（2卡 GPU 2,3）下适当降低，可根据显存再调
 
 train_dataloader = dict(
     batch_size=batch_size,

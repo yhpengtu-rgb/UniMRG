@@ -5,9 +5,12 @@ from src.models.mar.mar import mar_huge
 from src.models.mar.vae import AutoencoderKL
 from src.models.harmon import Harmon
 from xtuner.utils import PROMPT_TEMPLATE
-from transformers import AutoTokenizer
+from src.models.dllm.mask_token import load_harmon_tokenizer
 
-llm_name_or_path = 'Qwen/Qwen2.5-1.5B-Instruct'
+llm_name_or_path = __import__('os').environ.get(
+    'HARMON_LLM_PATH',
+    '/nvmedata/xiexu/data/uni/Qwen2.5-1.5B-Instruct',
+)
 prompt_template = dict(
     SYSTEM='<|im_start|>system\n{system}<|im_end|>\n',
     INSTRUCTION='<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n',
@@ -17,10 +20,11 @@ prompt_template = dict(
     STOP_WORDS=['<|im_end|>', '<|endoftext|>'])
 
 tokenizer = dict(
-    type=AutoTokenizer.from_pretrained,
+    type=load_harmon_tokenizer,
     pretrained_model_name_or_path=llm_name_or_path,
     trust_remote_code=True,
-    padding_side='right')
+    padding_side='right',
+    local_files_only=True)
 
 # VAE: place ``kl16.ckpt`` under checkpoints/ (path configurable).
 model = dict(
@@ -30,7 +34,10 @@ model = dict(
     vae=dict(type=AutoencoderKL,
              embed_dim=16,
              ch_mult=(1, 1, 2, 2, 4),
-             ckpt_path='/cpfs01/projects-HDD/cfff-6f3a36a0cd1e_HDD/public/tupeng/UniMRG/Harmon/checkpoints/kl16.ckpt'),
+             ckpt_path=__import__('os').environ.get(
+                 'HARMON_VAE_CHECKPOINT',
+                 '/nvmedata/xiexu/data/uni/kl16.ckpt',
+             )),
     vae_scale=0.2325,
     llm=dict(
         type=AutoModelForCausalLM.from_pretrained,
