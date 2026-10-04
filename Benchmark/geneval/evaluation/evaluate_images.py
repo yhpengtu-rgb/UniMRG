@@ -50,6 +50,8 @@ def parse_args():
     if args.model_config is None:
         args.model_config = os.path.join(
             os.path.dirname(mmdet.__file__),
+            ".mim/configs/mask2former/mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco.py"
+            if int(mmdet.__version__.split('.')[0]) >= 3 else
             "../configs/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py"
         )
     return args
@@ -73,10 +75,28 @@ def load_models(args):
     CONFIG_PATH = args.model_config
     OBJECT_DETECTOR = args.options.get('model', "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco")
     CKPT_PATH = os.path.join(args.model_path, f"{OBJECT_DETECTOR}.pth")
-    object_detector = init_detector(CONFIG_PATH, CKPT_PATH, device=DEVICE)
+    if int(mmdet.__version__.split('.')[0]) >= 3:
+        checkpoint = torch.load(CKPT_PATH, map_location='cpu', weights_only=False)
+        weights = checkpoint['state_dict']
+        # MMDetection renamed transformer submodules in 3.x. Attention 0 in
+        # the Mask2Former decoder is cross attention; attention 1 is self attention.
+        converted = {}
+        for key, value in weights.items():
+            if 'pixel_decoder.encoder.layers.' in key:
+                key = key.replace('.attentions.0.', '.self_attn.')
+            elif 'transformer_decoder.layers.' in key:
+                key = key.replace('.attentions.0.', '.cross_attn.').replace('.attentions.1.', '.self_attn.')
+            key = key.replace('.ffns.0.', '.ffn.')
+            converted[key] = value
+        object_detector = init_detector(CONFIG_PATH, None, device=DEVICE)
+        # Reject incomplete loading rather than scoring with random parameters.
+        object_detector.load_state_dict(converted, strict=True)
+        print('Detector weights loaded completely (MMDetection 3.x compatibility).', file=sys.stderr)
+    else:
+        object_detector = init_detector(CONFIG_PATH, CKPT_PATH, device=DEVICE)
 
     clip_arch = args.options.get('clip_model', "ViT-L-14")
-    clip_model, _, transform = open_clip.create_model_and_transforms(clip_arch, pretrained="openai", device=DEVICE)
+    clip_model, _, transform = open_clip.create_model_and_transforms(clip_arch, pretrained="openai", device=DEVICE, force_quick_gelu=True)
     tokenizer = open_clip.get_tokenizer(clip_arch)
 
     with open(os.path.join(os.path.dirname(__file__), "object_names.txt")) as cls_file:
@@ -234,8 +254,16 @@ def evaluate(image, objects, metadata):
 
 def evaluate_image(filepath, metadata):
     result = inference_detector(object_detector, filepath)
-    bbox = result[0] if isinstance(result, tuple) else result
-    segm = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+    if hasattr(result, 'pred_instances'):  # MMDetection 3.x
+        instances = result.pred_instances.cpu()
+        labels = instances.labels.numpy()
+        boxes = np.concatenate([instances.bboxes.numpy(), instances.scores.numpy()[:, None]], axis=1)
+        bbox = [boxes[labels == index] for index in range(len(classnames))]
+        masks = instances.masks.numpy() if 'masks' in instances else None
+        segm = [masks[labels == index] for index in range(len(classnames))] if masks is not None else None
+    else:  # MMDetection 2.x
+        bbox = result[0] if isinstance(result, tuple) else result
+        segm = result[1] if isinstance(result, tuple) and len(result) > 1 else None
     image = ImageOps.exif_transpose(Image.open(filepath))
     detected = {}
     # Determine bounding boxes to keep
@@ -271,25 +299,54 @@ def evaluate_image(filepath, metadata):
 
 
 def main(args):
-    full_results = []
-    for subfolder in tqdm(os.listdir(args.imagedir)):
+    # Persist each image so interrupted scoring can resume without repeating inference.
+    cached = {}
+    if os.path.isfile(args.outfile):
+        with open(args.outfile) as stream:
+            lines = stream.readlines()
+        for index, line in enumerate(lines):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                if index != len(lines) - 1:
+                    raise
+                continue
+            cached[row['filename']] = row
+    if os.path.dirname(args.outfile):
+        os.makedirs(os.path.dirname(args.outfile), exist_ok=True)
+    with open(args.outfile, 'w') as stream:
+        for row in cached.values():
+            stream.write(json.dumps(row) + '\n')
+    for subfolder in tqdm(sorted(os.listdir(args.imagedir))):
         folderpath = os.path.join(args.imagedir, subfolder)
         if not os.path.isdir(folderpath) or not subfolder.isdigit():
             continue
         with open(os.path.join(folderpath, "metadata.jsonl")) as fp:
             metadata = json.load(fp)
         # Evaluate each image
-        for imagename in os.listdir(os.path.join(folderpath, "samples")):
+        for imagename in sorted(os.listdir(os.path.join(folderpath, "samples"))):
             imagepath = os.path.join(folderpath, "samples", imagename)
             if not os.path.isfile(imagepath) or not re.match(r"\d+\.png", imagename):
                 continue
+            stat = os.stat(imagepath)
+            stamp = [stat.st_size, stat.st_mtime_ns]
+            previous = cached.get(imagepath)
+            if previous and previous.get('image_stamp') == stamp and json.loads(previous['metadata']) == metadata:
+                continue
             result = evaluate_image(imagepath, metadata)
-            full_results.append(result)
-    # Save results
-    if os.path.dirname(args.outfile):
-        os.makedirs(os.path.dirname(args.outfile), exist_ok=True)
-    with open(args.outfile, "w") as fp:
-        pd.DataFrame(full_results).to_json(fp, orient="records", lines=True)
+            result['image_stamp'] = stamp
+            cached[imagepath] = result
+            with open(args.outfile, 'a') as fp:
+                fp.write(json.dumps(result) + '\n')
+    # Drop stale entries and earlier versions of overwritten images.
+    current = {os.path.join(args.imagedir, folder, 'samples', filename)
+               for folder in os.listdir(args.imagedir) if folder.isdigit()
+               for filename in os.listdir(os.path.join(args.imagedir, folder, 'samples'))
+               if re.fullmatch(r'\d+\.png', filename)}
+    with open(args.outfile, 'w') as stream:
+        for name, result in cached.items():
+            if name in current:
+                stream.write(json.dumps(result) + '\n')
 
 
 if __name__ == "__main__":

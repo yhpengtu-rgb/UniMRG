@@ -44,6 +44,26 @@ def set_seed(seed=0):
         torch.backends.cudnn.benchmark = False
 
 
+def sample_images(model, conditions, batch_size, *, image_size=512,
+                  num_iter=64, cfg=3.0, cfg_schedule='constant',
+                  temperature=1.0, progress=True):
+    """Sample a batch using the original positive/negative CFG ordering."""
+    input_ids = conditions['input_ids']
+    attention_mask = conditions['attention_mask']
+    if cfg != 1.0:
+        input_ids = torch.cat([input_ids[0:1].expand(batch_size, -1),
+                               input_ids[1:2].expand(batch_size, -1)])
+        attention_mask = torch.cat([attention_mask[0:1].expand(batch_size, -1),
+                                    attention_mask[1:2].expand(batch_size, -1)])
+    else:
+        input_ids = input_ids[0:1].expand(batch_size, -1)
+        attention_mask = attention_mask[0:1].expand(batch_size, -1)
+    return model.sample(input_ids=input_ids, attention_mask=attention_mask,
+                        num_iter=num_iter, cfg=cfg, cfg_schedule=cfg_schedule,
+                        temperature=temperature, progress=progress,
+                        image_shape=(image_size // 16, image_size // 16))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', help='config file path.', default='configs/models/qwen2_5_1_5b_kl16_mar_h.py')
@@ -122,38 +142,15 @@ if __name__ == "__main__":
         print(f"Processing prompt: {full_prompt}", flush=True)
         class_info = model.prepare_text_conditions(full_prompt, args.cfg_prompt)
         
-        input_ids = class_info['input_ids']
-        attention_mask = class_info['attention_mask']
-        
-        assert len(input_ids) == 2
-        
+        assert len(class_info['input_ids']) == 2
         batch_size = args.batch_size
-        
-        if args.guidance_scale != 1.0:
-            input_ids = torch.cat([
-                input_ids[0:1].expand(batch_size, -1),
-                input_ids[1:2].expand(batch_size, -1),
-            ])
-            attention_mask = torch.cat([
-                attention_mask[0:1].expand(batch_size, -1),
-                attention_mask[1:2].expand(batch_size, -1),
-            ])
-        else:
-            input_ids = input_ids[0:1].expand(batch_size, -1)
-            attention_mask = attention_mask[0:1].expand(batch_size, -1)
-        
-        img_h = img_w = args.image_size // 16
-        
         try:
             with torch.no_grad():
-                samples = model.sample(input_ids=input_ids, 
-                                      attention_mask=attention_mask,
-                                      num_iter=args.generation_timesteps, 
-                                      cfg=args.guidance_scale, 
-                                      cfg_schedule=args.cfg_schedule,
-                                      temperature=args.temperature, 
-                                      progress=True, 
-                                      image_shape=(img_h, img_w))
+                samples = sample_images(
+                    model, class_info, batch_size, image_size=args.image_size,
+                    num_iter=args.generation_timesteps, cfg=args.guidance_scale,
+                    cfg_schedule=args.cfg_schedule, temperature=args.temperature,
+                    progress=True)
         except Exception as e:
             print(f"Error during sampling: {type(e).__name__}: {e}", flush=True)
             import traceback

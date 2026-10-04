@@ -4,3 +4,8 @@ data
 *work_dirs
 *.pth
 model/*.pth
+
+# Generated caches
+__pycache__/
+*.py[cod]
+.cache/

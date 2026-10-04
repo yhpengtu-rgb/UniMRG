@@ -152,6 +152,40 @@ work_dirs/UniMRG/
 
 ## 🚀 Evaluation
 
+### Pixel branch (GenEval / DPGBench)
+
+The prompt datasets are stored with the other data at
+`/nvmedata/xiexu/data/Benchmark/{geneval,dpg_bench}`. The evaluation entry
+point validates these files and uses `/nvmedata/xiexu/data/uni/harmon_1.5b.pth`
+by default. Run from the repository root:
+
+```bash
+# Two GPUs, one image per GPU, to check the checkpoint and pixel branch.
+CUDA_VISIBLE_DEVICES=0,1 /home/xiexu/anaconda3/envs/harmon/bin/torchrun \
+  --standalone --nproc_per_node=2 Harmon/scripts/eval_pixel.py \
+  --benchmark geneval --limit 2 \
+  --samples-per-prompt 1 --image-size 256 --num-iter 2 \
+  --output-dir /nvmedata/xiexu/data/Benchmark/pixel_results/harmon_1.5b_geneval_smoke_2gpu
+
+# Full benchmark generation: 553 GenEval prompts × 12 images.
+CUDA_VISIBLE_DEVICES=0,1 /home/xiexu/anaconda3/envs/harmon/bin/torchrun \
+  --standalone --nproc_per_node=2 Harmon/scripts/eval_pixel.py \
+  --benchmark geneval --batch-size 12 --resume-with-new-batch-size
+
+# Full benchmark generation: 1065 DPGBench prompts × 4 images.
+CUDA_VISIBLE_DEVICES=0,1 /home/xiexu/anaconda3/envs/harmon/bin/torchrun \
+  --standalone --nproc_per_node=2 Harmon/scripts/eval_pixel.py \
+  --benchmark dpgbench --batch-size 4 --resume-with-new-batch-size
+```
+
+Use `--checkpoint`, `--prompts`, or `--output-dir` to override the defaults.
+Generated images go to `/nvmedata/xiexu/data/Benchmark/pixel_results/`.
+Run a resume command only after the previous process writing that output
+directory has ended. Existing images are kept; a new batch size changes the
+random samples used for images generated after resuming.
+The bundled GenEval and DPGBench scorers can score full outputs; the two-prompt
+smoke run only checks that image generation works on both GPUs.
+
 
 ### Visualization
 

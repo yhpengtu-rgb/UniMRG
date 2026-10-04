@@ -17,6 +17,7 @@ import os
 import random
 import numpy as np
 import torch
+from geneval import sample_images
 from src.builder import BUILDER
 from PIL import Image
 from mmengine.config import Config
@@ -116,34 +117,13 @@ if __name__ == "__main__":
         full_prompt = f"Generate an image: {prompt}"
         class_info = model.prepare_text_conditions(full_prompt, args.cfg_prompt)
         
-        input_ids = class_info['input_ids']
-        attention_mask = class_info['attention_mask']
-        
-        if args.guidance_scale != 1.0:
-            input_ids = torch.cat([
-                input_ids[0:1].expand(batch_size, -1),
-                input_ids[1:2].expand(batch_size, -1),
-            ])
-            attention_mask = torch.cat([
-                attention_mask[0:1].expand(batch_size, -1),
-                attention_mask[1:2].expand(batch_size, -1),
-            ])
-        else:
-            input_ids = input_ids[0:1].expand(batch_size, -1)
-            attention_mask = attention_mask[0:1].expand(batch_size, -1)
-        
-        img_h = img_w = args.image_size // 16
-        
         with torch.no_grad():
-            samples = model.sample(input_ids=input_ids, 
-                                  attention_mask=attention_mask,
-                                  num_iter=args.generation_timesteps, 
-                                  cfg=args.guidance_scale, 
-                                  cfg_schedule=args.cfg_schedule,
-                                  temperature=args.temperature, 
-                                  progress=True, 
-                                  image_shape=(img_h, img_w))
-        
+            samples = sample_images(
+                model, class_info, batch_size, image_size=args.image_size,
+                num_iter=args.generation_timesteps, cfg=args.guidance_scale,
+                cfg_schedule=args.cfg_schedule, temperature=args.temperature,
+                progress=True)
+
         for idx, sample in enumerate(samples):
             sample = torch.clamp(127.5 * sample + 128.0, 0, 255).to("cpu", dtype=torch.uint8).numpy()
             sample = sample.transpose(1, 2, 0)
