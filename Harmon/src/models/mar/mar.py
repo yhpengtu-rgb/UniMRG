@@ -263,7 +263,8 @@ class MAR(nn.Module):
 
         return x
 
-    def forward_mae_decoder(self, x, mask, image_shape=None, x_con=None):
+    def forward_mae_decoder(self, x, mask, image_shape=None, x_con=None,
+                            masked_query_residual=None):
         bsz, seq_len = mask.shape
 
         x = self.decoder_embed(x)
@@ -277,6 +278,8 @@ class MAR(nn.Module):
         else:
             x_after_pad = mask_tokens.clone()
         x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+        if masked_query_residual is not None:
+            x_after_pad = x_after_pad + masked_query_residual * mask_with_buffer.bool().unsqueeze(-1)
 
         # decoder position embedding
         # x = x_after_pad + self.decoder_pos_embed_learned

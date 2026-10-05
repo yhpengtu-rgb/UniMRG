@@ -54,10 +54,13 @@ def main():
     p.add_argument("--output", default=None)
     p.add_argument("--image_size", type=int, default=512)
     p.add_argument("--num_iter", type=int, default=32)
-    p.add_argument("--cfg", type=float, default=3.0)
+    p.add_argument("--cfg", type=float, default=None)
     args = p.parse_args()
 
     model = load_model(args.config, args.checkpoint)
+    pixel_dllm = args.mode == "pixel" and getattr(model, "pixel_dllm", False)
+    sampler = model.sample_pixel_dllm if pixel_dllm else model.sample_recon
+    cfg = args.cfg if args.cfg is not None else (1.0 if pixel_dllm else 3.0)
     pil = Image.open(args.input_image).convert("RGB").resize((args.image_size, args.image_size))
     x = torch.from_numpy(np.array(pil)).to(device=model.device, dtype=model.dtype)
     x = rearrange(x, "h w c -> 1 c h w") / 255.0 * 2.0 - 1.0
@@ -69,8 +72,8 @@ def main():
         model.gradient_checkpointing_disable()
     try:
         with torch.no_grad():
-            pred = model.sample_recon(
-                x, prompt=MODE_PROMPT[args.mode], num_iter=args.num_iter, cfg=args.cfg, progress=True
+            pred = sampler(
+                x, prompt=MODE_PROMPT[args.mode], num_iter=args.num_iter, cfg=cfg, progress=True
             )[0]
     finally:
         llm.config.use_cache = old_cache
