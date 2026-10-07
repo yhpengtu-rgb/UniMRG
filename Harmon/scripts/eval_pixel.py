@@ -12,12 +12,13 @@ import json
 import os
 import random
 import time
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
+from pixel_eval_utils import (load_checkpoint_state, load_model as load_dllm_model,
+                             load_pixel_weights, sample_dllm_images)
 
 HARMON_ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path('/nvmedata/xiexu/data')
@@ -81,6 +82,8 @@ def seed_all(seed, torch):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--benchmark', choices=PROMPTS, default='geneval')
+    parser.add_argument('--sampler', choices=['mar', 'pixel_dllm'], default='mar',
+                        help='pixel_dllm uses trained mask queries and bidirectional targets')
     parser.add_argument('--checkpoint', type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument('--config', type=Path,
                         default=HARMON_ROOT / 'configs/models/qwen2_5_1_5b_kl16_mar_h.py')
@@ -119,12 +122,14 @@ def main():
         rows = rows[:args.limit]
     output_dir = args.output_dir or (DATA_ROOT / 'Benchmark/pixel_results' /
                                      f'harmon_1.5b_{args.benchmark}')
-    if not args.checkpoint.is_file():
+    if not args.checkpoint.exists() or (args.sampler == 'mar' and not args.checkpoint.is_file()):
         raise FileNotFoundError(f'Missing checkpoint: {args.checkpoint}')
     if not args.config.is_file():
         raise FileNotFoundError(f'Missing model config: {args.config}')
     print(f'Benchmark: {args.benchmark}; prompts: {len(rows)}; samples/prompt: {count}', flush=True)
     print(f'Prompt file: {prompt_path}\nCheckpoint: {args.checkpoint}\nOutput: {output_dir}', flush=True)
+    print(f'Task: text-to-image; sampler: {args.sampler}; rounds: {args.num_iter}; '
+          f'CFG: {args.cfg}; batch/GPU: {args.batch_size}', flush=True)
     if args.dry_run:
         print(f'First output: {output_paths(args.benchmark, output_dir, 0, rows[0], count)[0]}')
         return
@@ -158,6 +163,13 @@ def main():
         'seed': args.seed,
         'world_size': world_size,
     }
+    if args.sampler == 'pixel_dllm':
+        run_spec.update(
+            task='text2image', sampler='sample_pixel_dllm_t2i',
+            model_config=str(args.config.resolve()),
+            config_sha256=hashlib.sha256(args.config.read_bytes()).hexdigest(),
+            sampler_code_sha256=hashlib.sha256(
+                (HARMON_ROOT / 'src/models/harmon_pixel_dllm.py').read_bytes()).hexdigest())
     # Keep batch-size 1 manifests compatible with runs already in progress.
     if args.batch_size != 1:
         run_spec['batch_size'] = args.batch_size
@@ -192,43 +204,15 @@ def main():
     if world_size > 1:
         dist.barrier()
 
-    from mmengine.config import Config
-    import sys
-    sys.path.insert(0, str(HARMON_ROOT))
-    from src.builder import BUILDER
-    from geneval import sample_images
+    if args.sampler == 'pixel_dllm':
+        model = load_dllm_model(args.config, args.checkpoint, device)
+        generate = sample_dllm_images
+    else:
+        model = load_mar_model(args.config, args.checkpoint, device, torch)
+        from geneval import sample_images
+        generate = sample_images
 
-    config = Config.fromfile(str(args.config))
-    # The installed flash_attn unpad_input returns five values, while this
-    # Transformers release expects four. Match the existing inference configs.
-    config.model.llm.attn_implementation = 'sdpa'
-    model = BUILDER.build(config.model).eval().to(device)
-    model = model.to(model.dtype)
-    state = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    if isinstance(state, dict) and 'state_dict' in state:
-        state = state['state_dict']
-    if not isinstance(state, dict):
-        raise TypeError('Checkpoint does not contain a state dict')
-    state = {key.removeprefix('module.'): value for key, value in state.items()}
-    matched = len(set(state).intersection(model.state_dict()))
-    if matched == 0:
-        raise RuntimeError('Checkpoint has no model keys in common with the config')
-    info = model.load_state_dict(state, strict=False)
-    print(f'Loaded {matched} keys; missing={len(info.missing_keys)}, '
-          f'unexpected={len(info.unexpected_keys)}', flush=True)
-    if info.missing_keys:
-        print('Missing key groups:', dict(Counter(
-            key.split('.', 1)[0] for key in info.missing_keys)), flush=True)
-    if info.unexpected_keys:
-        print('Unexpected key groups:', dict(Counter(
-            key.split('.', 1)[0] for key in info.unexpected_keys)), flush=True)
-    if info.unexpected_keys or any(not key.startswith('vae.') for key in info.missing_keys):
-        raise RuntimeError('Checkpoint does not match the Harmon pixel model; '
-                           'only VAE keys may be absent (VAE uses its own checkpoint)')
-    del state
-
-    # Divide only unfinished prompts. A resumed run may have work left on
-    # just one parity; static index sharding would leave the other GPU idle.
+    # Divide only unfinished prompts, so resumed work uses all available GPUs.
     unfinished = [index for index, row in enumerate(rows)
                   if any(not complete_image(path, args.image_size) for path in
                          output_paths(args.benchmark, output_dir, index, row, count))]
@@ -257,9 +241,11 @@ def main():
             torch.cuda.reset_peak_memory_stats(device)
             started = time.perf_counter()
             with torch.inference_mode():
-                results = sample_images(
+                results = generate(
                     model, conditions, batch_size, image_size=args.image_size,
                     num_iter=args.num_iter, cfg=args.cfg, progress=False)
+            if results.shape[0] != batch_size:
+                raise RuntimeError('Sampler output count differs from the requested batch')
             for (_, path), result in zip(batch, results):
                 image = (result.float().clamp(-1, 1).add(1).mul(127.5)
                          .to(torch.uint8).cpu().permute(1, 2, 0).numpy())
@@ -274,6 +260,22 @@ def main():
         dist.destroy_process_group()
     if rank == 0:
         print('Image generation complete.', flush=True)
+
+
+def load_mar_model(config_path, checkpoint, device, torch):
+    """Keep the original baseline loader separate from DLLM checkpoint loading."""
+    from mmengine.config import Config
+    import sys
+    sys.path.insert(0, str(HARMON_ROOT))
+    from src.builder import BUILDER
+    config = Config.fromfile(str(config_path))
+    # The installed flash_attn unpad_input returns five values, while this
+    # Transformers release expects four. Match the existing inference configs.
+    config.model.llm.attn_implementation = 'sdpa'
+    model = BUILDER.build(config.model).eval().to(device)
+    model = model.to(model.dtype)
+    load_pixel_weights(model, load_checkpoint_state(checkpoint, torch))
+    return model
 
 
 if __name__ == '__main__':

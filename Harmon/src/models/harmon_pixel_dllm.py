@@ -105,10 +105,50 @@ class HarmonPixelDLLM(HarmonDev):
         ids = torch.cat((ids[:, :3], ids.new_full((1, 1), IMAGE_TOKEN_INDEX), ids[:, 3:]), dim=1)
         ids = ids.expand(batch, -1)
         condition, valid = self._pixel_condition(source, ids, torch.ones_like(ids, dtype=torch.bool))
+        return self._sample_pixel_dllm(
+            condition, valid, (height, width), channels,
+            num_iter=num_iter, temperature=temperature, cfg=cfg, progress=progress)
+
+    @torch.no_grad()
+    def sample_pixel_dllm_t2i(self, input_ids, attention_mask, image_shape=None,
+                              num_iter=4, temperature=1.0, cfg=3.0, progress=False):
+        """Generate from text through trained mask queries and bidirectional targets.
+
+        CFG batches follow the original sampler: all positive conditions first,
+        then matching weak conditions. No source image or AR sampling is used.
+        """
+        if not self.pixel_dllm:
+            raise RuntimeError('Text-to-image DLLM requires pixel_dllm=True; no AR fallback')
+        if (input_ids == IMAGE_TOKEN_INDEX).any():
+            raise ValueError('Text-to-image conditions must not contain source-image placeholders')
+        if input_ids.shape != attention_mask.shape:
+            raise ValueError('input_ids and attention_mask must have matching shapes')
+        condition = self.llm.get_input_embeddings()(input_ids.to(self.device))
+        valid = attention_mask.to(device=self.device, dtype=torch.bool)
+        if image_shape is None:
+            side = int(self.gen_seq_len ** 0.5)
+            image_shape = (side, side)
+        return self._sample_pixel_dllm(
+            condition, valid, image_shape, self.token_embed_dim,
+            num_iter=num_iter, temperature=temperature, cfg=cfg, progress=progress)
+
+    def _sample_pixel_dllm(self, condition, valid, image_shape, channels, *,
+                           num_iter, temperature, cfg, progress):
+        if num_iter < 1 or cfg <= 0:
+            raise ValueError('num_iter and cfg must be positive')
+        batch = condition.shape[0]
+        guided = cfg != 1.0
+        if guided and batch % 2:
+            raise ValueError('CFG requires paired positive and weak condition batches')
+        height, width = image_shape
+        if height < 1 or width < 1:
+            raise ValueError('image_shape dimensions must be positive')
         length = height * width
-        tokens = source.new_zeros(batch, length, channels)
+        tokens = condition.new_zeros(batch, length, channels)
         mask = torch.ones(batch, length, dtype=torch.bool, device=self.device)
         orders = self.mar.sample_orders(batch, seq_len=length)
+        if guided:
+            orders[batch // 2:] = orders[:batch // 2]
         for step in trange(num_iter, disable=not progress):
             decoded = self.forward_pixel_dllm(
                 tokens.reshape(batch, height, width, channels), mask.to(self.dtype), condition, valid)
@@ -119,8 +159,12 @@ class HarmonPixelDLLM(HarmonDev):
             commit = mask & ~next_mask
             if commit.any():
                 tokens[commit] = self.mar.diffloss.sample(
-                    decoded[commit], temperature=temperature, cfg=1.0).to(tokens.dtype)
+                    decoded[commit], temperature=temperature, cfg=cfg).to(tokens.dtype)
+            if guided:
+                tokens[batch // 2:] = tokens[:batch // 2]
             mask = next_mask
             if not mask.any():
                 break
-        return self.decode(tokens.reshape(batch, height, width, channels))
+        if guided:
+            tokens = tokens[:batch // 2]
+        return self.decode(tokens.reshape(-1, height, width, channels))

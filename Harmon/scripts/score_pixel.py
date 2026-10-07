@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score generated pixel images and update the concise base experiment record."""
+"""Score generated pixel images and update the experiment record."""
 import argparse
 import fcntl
 import hashlib
@@ -17,21 +17,56 @@ RECORD = ROOT / 'docs/experiments/PIXEL_EVAL_RESULTS_20261002.md'
 DATA = Path('/nvmedata/xiexu/data/Benchmark')
 
 
-def _update_record(path, experiment, summary):
-    lines = path.read_text(encoding='utf-8').splitlines()
-    for i, line in enumerate(lines):
-        if line.startswith(f'| {experiment} |'):
-            cells = [x.strip() for x in line.split('|')[1:-1]]
-            if len(cells) >= 7:
-                cells[4] = f"{summary['scored_images']}/{summary['expected_images']}"
-                cells[5] = '完整' if summary['complete'] else '部分样本'
-            score_column = 6 if len(cells) >= 7 else len(cells) - 1
-            cells[score_column] = f"{summary['score_percent']:.2f}" + (
-                '（部分样本）' if not summary['complete'] else '')
-            lines[i] = '| ' + ' | '.join(cells) + ' |'
-            break
+def _record_score_row(path, experiment, benchmark=None):
+    row_names = {experiment}
+    inferred_benchmark = None
+    if experiment == 'base-dpg-b1':
+        row_names.add('base')
+        inferred_benchmark = 'dpgbench'
     else:
-        raise ValueError(f'Experiment {experiment} is missing from {path}')
+        for name in ('geneval', 'dpgbench'):
+            suffix = '-' + name
+            if experiment.endswith(suffix):
+                row_names.add(experiment[:-len(suffix)])
+                inferred_benchmark = name
+                break
+    if benchmark and inferred_benchmark and benchmark != inferred_benchmark:
+        raise ValueError(f'Benchmark differs from experiment {experiment}')
+    benchmark = benchmark or inferred_benchmark
+    lines = path.read_text(encoding='utf-8').splitlines()
+    columns = {}
+    for i, line in enumerate(lines):
+        if not line.startswith('|'):
+            columns = {}
+            continue
+        cells = [x.strip() for x in line.split('|')[1:-1]]
+        if any(name in cells for name in ('分数（%）', 'Score (%)',
+                                         'GenEval（%）', 'DPGBench（%）')):
+            columns = {name: index for index, name in enumerate(cells)}
+            continue
+        if cells and cells[0] in row_names:
+            score_column = columns.get('分数（%）', columns.get('Score (%)'))
+            if score_column is None:
+                name = {'geneval': 'GenEval（%）', 'dpgbench': 'DPGBench（%）'}.get(benchmark)
+                score_column = columns.get(name)
+            if score_column is None or len(cells) != len(columns):
+                raise ValueError(f'Invalid score table for {experiment} in {path}')
+            return lines, i, cells, columns, score_column
+    raise ValueError(f'Experiment {experiment} is missing from {path}')
+
+
+def _update_record(path, experiment, summary):
+    lines, index, cells, columns, score_column = _record_score_row(
+        path, experiment, summary.get('benchmark'))
+    for name in ('评分图片/预期', 'Scored/expected'):
+        if name in columns:
+            cells[columns[name]] = f"{summary['scored_images']}/{summary['expected_images']}"
+    for name in ('状态', 'Status'):
+        if name in columns:
+            cells[columns[name]] = '完整' if summary['complete'] else '部分样本'
+    cells[score_column] = f"{summary['score_percent']:.2f}" + (
+        '（部分样本）' if not summary['complete'] else '')
+    lines[index] = '| ' + ' | '.join(cells) + ' |'
     path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
@@ -47,7 +82,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--benchmark', required=True, choices=['geneval', 'dpgbench'])
     parser.add_argument('--image-dir', required=True, type=Path)
-    parser.add_argument('--experiment', required=True, help='base-geneval / base-dpg-b1 / base-dpg-b4')
+    parser.add_argument('--experiment', required=True,
+                        help='Score run name, e.g. base-geneval / base-dpg-b1 / EXPERIMENT-dpgbench')
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--record', type=Path, default=RECORD)
     parser.add_argument('--allow-incomplete', action='store_true', help='Explicitly score available images as partial results')
@@ -67,6 +103,7 @@ def main():
     if hashlib.sha256(prompt_path.read_bytes()).hexdigest() != manifest['prompts_sha256']:
         parser.error('Prompt file differs from the generation manifest')
     rows = load_prompts(args.benchmark, prompt_path)
+    full_prompt_count = len(rows)
     if manifest.get('limit') is not None:
         rows = rows[:manifest['limit']]
     images = []
@@ -90,9 +127,10 @@ def main():
     print(f'{args.experiment}: {len(images)}/{expected} images; scores -> {output}', flush=True)
     if args.dry_run:
         return
-    if not any(line.startswith(f'| {args.experiment} |')
-               for line in args.record.read_text(encoding='utf-8').splitlines()):
-        parser.error(f'Experiment {args.experiment} is missing from {args.record}')
+    try:
+        _record_score_row(args.record, args.experiment, args.benchmark)
+    except ValueError as error:
+        parser.error(str(error))
     if int(os.environ.get('WORLD_SIZE', '1')) != 1:
         parser.error('Run one scoring process; select its GPU with CUDA_VISIBLE_DEVICES')
     import torch
@@ -141,7 +179,10 @@ def main():
     summary = dict(experiment=args.experiment, benchmark=args.benchmark,
                    scored_images=len(results), expected_images=expected,
                    complete_prompts=complete_prompts, total_prompts=len(rows),
-                   complete=len(images) == expected, score_percent=score,
+                   complete=len(images) == expected and len(rows) == full_prompt_count,
+                   sampler=manifest.get('sampler', 'sample'),
+                   num_iter=manifest['num_iter'], cfg=manifest['cfg'],
+                   batch_size=manifest.get('batch_size', 1), score_percent=score,
                    category_scores_percent=metrics)
     (output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     update_record(args.record, args.experiment, summary)
